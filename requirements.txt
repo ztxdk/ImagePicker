@@ -1,0 +1,6 @@
+PyQt5
+darkdetect
+exifread
+numpy
+rawpy
+win32mica; platform_system == "Windows"

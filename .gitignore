@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+.venv314/
+venv/
+
+# Build artifacts
+build/
+dist/
+output/
+*.spec
+
+# Local app/runtime files
+settings.json
+*.log
+
+# Sample/user image folders
+pics/
+edits/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
