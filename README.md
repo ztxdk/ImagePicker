@@ -4,6 +4,8 @@ Image Picker is a desktop photo culling tool for quickly reviewing a folder of i
 
 The current development version is `ImagePicker032.py`.
 
+This project is vibe coded: it was built iteratively with AI assistance and practical testing, with the goal of making the photo selection workflow fast and useful.
+
 ## Features
 
 - Fast folder loading for large photo sets.
