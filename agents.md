@@ -98,3 +98,6 @@ Denne fil logger alle handlinger udfort i forbindelse med den aktuelle opgave.
 91. Den byggede exe blev placeret som `output/ImagePicker034.exe` og smoke-testet ved kort opstart, hvorefter processen blev stoppet uden tidlig exit-fejl.
 92. Committen blev pushet til `origin/main`, GitHub CLI blev installeret med winget, og tagget `v0.34` blev oprettet og pushet.
 93. GitHub CLI var ikke logget ind, og der fandtes ingen `GH_TOKEN`/`GITHUB_TOKEN`, saa selve GitHub Release-oprettelsen og asset-upload kræver efterfoelgende GitHub login.
+94. GitHub CLI blev fundet via fuld sti `C:\Program Files\GitHub CLI\gh.exe`, fordi den aktuelle PowerShell-session ikke havde opdateret `PATH`.
+95. `gh` blev autentificeret ved at genbruge eksisterende Git Credential Manager-login for GitHub-kontoen `ztxdk`.
+96. GitHub release `v0.34` blev oprettet, og `output/ImagePicker034.exe` blev uploadet som release asset.
