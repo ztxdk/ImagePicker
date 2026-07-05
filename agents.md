@@ -101,3 +101,7 @@ Denne fil logger alle handlinger udfort i forbindelse med den aktuelle opgave.
 94. GitHub CLI blev fundet via fuld sti `C:\Program Files\GitHub CLI\gh.exe`, fordi den aktuelle PowerShell-session ikke havde opdateret `PATH`.
 95. `gh` blev autentificeret ved at genbruge eksisterende Git Credential Manager-login for GitHub-kontoen `ztxdk`.
 96. GitHub release `v0.34` blev oprettet, og `output/ImagePicker034.exe` blev uploadet som release asset.
+97. Bruger bad om, at kun den sidste Python-fil ligger paa GitHub.
+98. `ImagePicker032.py`, `ImagePicker033.py` og alle tracked `tests/test_imagepicker*.py` blev fjernet fra git-indexet med `git rm --cached`, saa de bevares lokalt men fjernes fra GitHub efter push.
+99. `.gitignore` blev udvidet med lokale historiske Python-versioner og `tests/`, saa de ikke bliver re-added ved et uheld.
+100. `README.md` blev opdateret til at pege paa `ImagePicker034.py` som eneste aktive Python-kildefil og fjerne testfil-referencer fra projektfiloversigten.

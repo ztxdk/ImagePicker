@@ -15,6 +15,11 @@ dist/
 output/
 *.spec
 
+# Local historical Python versions and local tests
+ImagePicker032.py
+ImagePicker033.py
+tests/
+
 # Local app/runtime files
 settings.json
 *.log

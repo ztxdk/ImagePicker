@@ -2,7 +2,7 @@
 
 Image Picker is a desktop photo culling tool for quickly reviewing a folder of images and selecting the files you want to keep, copy, move, or edit externally.
 
-The current development version is `ImagePicker032.py`.
+The current development version is `ImagePicker034.py`.
 
 This project is vibe coded: it was built iteratively with AI assistance and practical testing, with the goal of making the photo selection workflow fast and useful.
 
@@ -61,10 +61,10 @@ py -3.14 -m venv .venv
 Run the latest version:
 
 ```powershell
-.\.venv\Scripts\python.exe .\ImagePicker032.py
+.\.venv312\Scripts\python.exe .\ImagePicker034.py
 ```
 
-Older version files are kept in the repository for history and comparison, but `ImagePicker032.py` is the current optimized version.
+Older version files are kept in local history and Git history, but only `ImagePicker034.py` is kept as the active Python source file in the repository.
 
 ## Basic Workflow
 
@@ -105,7 +105,7 @@ Settings and logs are stored in the application config directory returned by Qt'
 
 ## Performance Notes
 
-Version 032 is optimized for one-off photo culling sessions on new folders. It intentionally does not use a persistent cache between application runs.
+Version 034 is optimized for one-off photo culling sessions on new folders. It intentionally does not use a persistent cache between application runs.
 
 Important performance choices:
 
@@ -117,25 +117,10 @@ Important performance choices:
 - JPG preview and thumbnails use `QImageReader.setScaledSize()` to avoid decoding more image data than needed.
 - Worker threads use `QImage`; `QPixmap` is created on the UI side.
 
-## Testing
-
-Run the test suite with:
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
-```
-
-Run only the latest version tests:
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest tests.test_imagepicker032
-```
-
 ## Project Files
 
-- `ImagePicker032.py`: Current optimized application version.
+- `ImagePicker034.py`: Current optimized application version.
 - `requirements.txt`: Runtime dependencies.
-- `tests/test_imagepicker032.py`: Tests for the current version.
 - `icons/`: UI icons used by the application.
 - `agents.md`: Development/task log for this project.
 - `TODO.md`: Historical prioritized technical TODO list.
