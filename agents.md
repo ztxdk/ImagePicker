@@ -90,3 +90,11 @@ Denne fil logger alle handlinger udfort i forbindelse med den aktuelle opgave.
 83. Version 34 blev rettet, saa genvalg efter sortering bevarer den aktuelle scrollbar-vaerdi og bruger `QItemSelectionModel` uden at kalde `scrollTo()`, saa viewet ikke traekkes tilbage til den aktive raekke under scrolling.
 84. Version 34-testene blev udvidet med en isoleret scrollbar-test, der verificerer at sorterings-genvalg ikke flytter scrollbar-positionen.
 85. `ImagePicker034.py` og `tests/test_imagepicker034.py` blev syntaksverificeret, version 34-testene bestod med 12 tests, og hele test-suiten bestod med 44 tests.
+86. Bruger bad om commit, push, compile og GitHub release.
+87. `.gitignore` blev udvidet med `.venv*/`, saa det nye lokale `.venv312`-miljoe ikke inkluderes i git.
+88. Git author blev sat lokalt til `ztxdk <ztxdk@users.noreply.github.com>`, og ændringerne for version 33/34 blev committet.
+89. `ImagePicker034.py` og `tests/test_imagepicker034.py` blev syntaksverificeret igen, og version 34-testene bestod med 12 tests.
+90. `PyInstaller` blev installeret i `.venv312`, og `ImagePicker034.py` blev bygget som one-file Windows GUI-exe med projektikon og `icons`-mappen inkluderet.
+91. Den byggede exe blev placeret som `output/ImagePicker034.exe` og smoke-testet ved kort opstart, hvorefter processen blev stoppet uden tidlig exit-fejl.
+92. Committen blev pushet til `origin/main`, GitHub CLI blev installeret med winget, og tagget `v0.34` blev oprettet og pushet.
+93. GitHub CLI var ikke logget ind, og der fandtes ingen `GH_TOKEN`/`GITHUB_TOKEN`, saa selve GitHub Release-oprettelsen og asset-upload kræver efterfoelgende GitHub login.
