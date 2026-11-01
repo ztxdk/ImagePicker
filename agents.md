@@ -128,3 +128,5 @@ Denne fil logger alle handlinger udfort i forbindelse med den aktuelle opgave.
 121. `requirements.txt` blev versionslaast, og de pinned versioner blev verificeret i et midlertidigt Python 3.14-miljoe.
 122. `tests/test_imagepicker035.py` blev udvidet til 38 tests med filoperationstraaden, thumbnail-eviction, HEIC-besked og refresh af completed metadata.
 123. `tests/`, `ImagePicker035.spec` og den pinned `requirements.txt` blev gjort til en del af repoet, og `.gitignore` blev justeret saa kun historiske testfiler og version 034 ignoreres.
+124. Hele test-suiten bestod med 82 tests i baade Python 3.13 (`.venv313`) og Python 3.14 (midlertidigt `.venv314-test`, fjernet igen).
+125. `ImagePicker035.exe` blev bygget med PyInstaller fra den tracked spec til `output/ImagePicker035.exe` (ca. 51 MB) og smoke-testet ved opstart uden tidlig exit.
