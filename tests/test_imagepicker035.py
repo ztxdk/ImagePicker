@@ -554,6 +554,28 @@ class ImagePicker035Tests(unittest.TestCase):
             thread.cancel()
             thread.wait(5000)
 
+    def test_settings_dialog_is_readable_in_dark_mode(self):
+        window = self.run_window()
+        try:
+            window._is_dark_mode = True
+            window.apply_theme()
+            dialog = mod.SettingsWindow(window.settings_manager, window)
+            try:
+                dialog.show()
+                self.app.processEvents()
+                self.app.processEvents()
+
+                image = dialog.grab().toImage()
+                field_point = dialog.source_input.mapTo(dialog, mod.QPoint(6, 6))
+                label_area = image.pixelColor(20, field_point.y())
+                field_color = image.pixelColor(field_point)
+                self.assertLess(sum(field_color.getRgb()[:3]), 200)
+                self.assertLess(sum(label_area.getRgb()[:3]), 200)
+            finally:
+                dialog.close()
+        finally:
+            window.close()
+
     # --- settings ---------------------------------------------------------
 
     def test_log_and_settings_share_the_config_dir(self):

@@ -130,3 +130,6 @@ Denne fil logger alle handlinger udfort i forbindelse med den aktuelle opgave.
 123. `tests/`, `ImagePicker035.spec` og den pinned `requirements.txt` blev gjort til en del af repoet, og `.gitignore` blev justeret saa kun historiske testfiler og version 034 ignoreres.
 124. Hele test-suiten bestod med 82 tests i baade Python 3.13 (`.venv313`) og Python 3.14 (midlertidigt `.venv314-test`, fjernet igen).
 125. `ImagePicker035.exe` blev bygget med PyInstaller fra den tracked spec til `output/ImagePicker035.exe` (ca. 51 MB) og smoke-testet ved opstart uden tidlig exit.
+126. Bruger meldte at settings-vinduet var ulaeseligt i dark mode. Aarsagen blev fundet ved at rendere dialogen offscreen: Qt kasserer et stylesheet der saettes i constructoren, naar foraeldervinduet allerede har et stylesheet, saa dialogen blev malet med den lyse app-palette.
+127. En faelles `ThemedDialog`-base blev tilfoejet, som anvender temaet igen naar dialogen vises; `SettingsWindow`, `FileOperationDialog` og `Win11MessageBox` arver nu fra den.
+128. Dark/light-rendering af settings-, besked- og filprogress-dialogen blev verificeret med screenshots, og en regressionstest (`test_settings_dialog_is_readable_in_dark_mode`) blev tilfoejet, saa hele suiten nu er paa 39 tests for version 035 (83 inkl. historiske tests).

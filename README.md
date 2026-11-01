@@ -137,10 +137,12 @@ Important performance choices:
 The test suite uses the offscreen Qt platform, so it runs without opening windows:
 
 ```powershell
-.\.venv313\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+.\.venv313\Scripts\python.exe -m unittest discover -s tests -p "test_imagepicker035.py"
 ```
 
-`tests/test_imagepicker035.py` covers folder scanning, RAW/JPG pairing, table model sorting, same-folder copy/move safety, atomic replacement, the file operation thread, stale loader signals and the settings fallback.
+`tests/test_imagepicker035.py` covers folder scanning, RAW/JPG pairing, table model sorting, same-folder copy/move safety, atomic replacement, the file operation thread, stale loader signals, the dark-mode settings dialog and the settings fallback.
+
+Older version test files may still exist locally; they are excluded from the command above because they exercise historical versions of the app.
 
 ## Building a Windows executable
 

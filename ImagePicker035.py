@@ -1,4 +1,4 @@
-import datetime
+﻿import datetime
 import json
 import logging
 import logging.handlers
@@ -663,7 +663,39 @@ class SettingsManager:
         return self.current_settings.get(key, self.default_settings.get(key))
 
 
-class SettingsWindow(QDialog):
+class ThemedDialog(QDialog):
+    """Dialog that reliably applies its own stylesheet.
+
+    Qt drops a stylesheet that is set in the constructor when the parent window
+    already has a stylesheet of its own, which leaves the dialog painted with
+    the light application palette. Re-applying the theme when the dialog is
+    shown works around that.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._theme_ready = False
+
+    def apply_theme(self):
+        raise NotImplementedError
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._theme_ready:
+            self._theme_ready = True
+            self.apply_theme()
+            QTimer.singleShot(0, self._reapply_theme)
+
+    def _reapply_theme(self):
+        try:
+            if self.isVisible():
+                self.apply_theme()
+        except RuntimeError:
+            # The dialog was destroyed before the deferred call ran.
+            pass
+
+
+class SettingsWindow(ThemedDialog):
     def __init__(self, settings_manager, parent=None):
         super().__init__(parent)
         self.settings_manager = settings_manager
@@ -1155,7 +1187,7 @@ class SettingsWindow(QDialog):
             combo.view().setStyleSheet(view_style)
 
 
-class FileOperationDialog(QDialog):
+class FileOperationDialog(ThemedDialog):
     def __init__(self, parent=None, operation="", total_files=0):
         super().__init__(parent)
         self._cancelled = False
@@ -1240,7 +1272,7 @@ class FileOperationDialog(QDialog):
         self.progress_bar.setValue(current_file)
 
 
-class Win11MessageBox(QDialog):
+class Win11MessageBox(ThemedDialog):
     def __init__(self, parent=None, title="", message="", buttons=QMessageBox.Ok, icon=QMessageBox.Information):
         super().__init__(parent)
         self.setWindowTitle(title)
