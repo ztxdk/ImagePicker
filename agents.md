@@ -133,3 +133,5 @@ Denne fil logger alle handlinger udfort i forbindelse med den aktuelle opgave.
 126. Bruger meldte at settings-vinduet var ulaeseligt i dark mode. Aarsagen blev fundet ved at rendere dialogen offscreen: Qt kasserer et stylesheet der saettes i constructoren, naar foraeldervinduet allerede har et stylesheet, saa dialogen blev malet med den lyse app-palette.
 127. En faelles `ThemedDialog`-base blev tilfoejet, som anvender temaet igen naar dialogen vises; `SettingsWindow`, `FileOperationDialog` og `Win11MessageBox` arver nu fra den.
 128. Dark/light-rendering af settings-, besked- og filprogress-dialogen blev verificeret med screenshots, og en regressionstest (`test_settings_dialog_is_readable_in_dark_mode`) blev tilfoejet, saa hele suiten nu er paa 39 tests for version 035 (83 inkl. historiske tests).
+129. Aendringen blev committet som `b1b022e` og pushet til `origin/main`; tagget `v0.35` blev oprettet og pushet.
+130. GitHub release `v0.35` blev oprettet med `output/ImagePicker035.exe` (51 MB) som asset.
