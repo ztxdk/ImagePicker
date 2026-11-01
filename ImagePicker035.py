@@ -82,10 +82,11 @@ def ensure_application_identity():
     """Set the Qt application identity before anything reads QStandardPaths.
 
     Both the log file and the settings file derive their location from this, so
-    it has to be configured at import time rather than in main().
+    it has to be configured at import time rather than in main(). Only the
+    application name is set; adding an organization name would turn the config
+    directory into "<org>/<app>" and split it from older installs.
     """
     QCoreApplication.setApplicationName(APP_ID)
-    QCoreApplication.setOrganizationName(APP_ID)
 
 
 def is_windows():
@@ -2600,8 +2601,17 @@ class MainWindow(QMainWindow):
         self.resize_timer.start(150)
 
     def reload_preview_after_resize(self):
-        if self.current_image_path:
-            self.load_preview_image(self.current_image_path, low_quality=True)
+        if not self.current_image_path:
+            return
+        self.load_preview_image(self.current_image_path, low_quality=True)
+        QTimer.singleShot(400, self.refine_preview)
+
+    def refine_preview(self):
+        # The fast resize pass keeps dragging smooth; re-render once the window
+        # settles so the final image is smooth again.
+        path = self.current_image_path
+        if path and not is_raw_file(path):
+            self.load_preview_image(path, low_quality=False)
 
     def toggle_preview_mode(self):
         self.show_raw = self.toggle_button.isChecked()

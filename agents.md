@@ -120,3 +120,5 @@ Denne fil logger alle handlinger udfort i forbindelse med den aktuelle opgave.
 113. `ImagePicker035.py` og testfilen blev syntaksverificeret med `py_compile` og `pyflakes`, og hele test-suiten bestod med 74 tests.
 114. En offscreen smoke-test af version 035 indlaeste `pics`, viste preview via den nye async-traad, skiftede raekker og lukkede appen uden fejl.
 115. `README.md` blev opdateret til version 035 med nye performance-, sikkerheds- og konfigurationsnoter, `ImagePicker035.spec` blev oprettet, og `.gitignore` blev justeret saa kun version 035 er aktiv i repoet.
+116. Konfigurationsstien blev verificeret empirisk: `setOrganizationName` gav en dobbelt `ImagePicker\ImagePicker`-mappe, saa organisation-navnet blev fjernet og baade log og settings ligger nu i `%LOCALAPPDATA%\ImagePicker`, med gamle settings som fallback.
+117. Preview ved vindues-resize blev justeret til foerst en hurtig lav-kvalitets-render og derefter en automatisk skarp genrendering efter 400 ms for ikke-RAW billeder.
