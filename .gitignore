@@ -13,9 +13,9 @@ venv/
 build/
 dist/
 output/
-*.spec
+ImagePicker034.spec
 
-# Local historical Python versions and local tests
+# Local historical Python versions and local historical tests
 ImagePicker022.py
 ImagePicker028.py
 ImagePicker029.py
@@ -24,7 +24,11 @@ ImagePicker031.py
 ImagePicker032.py
 ImagePicker033.py
 ImagePicker034.py
-tests/
+tests/test_imagepicker030.py
+tests/test_imagepicker031.py
+tests/test_imagepicker032.py
+tests/test_imagepicker033.py
+tests/test_imagepicker034.py
 
 # Local app/runtime files
 settings.json

@@ -501,6 +501,67 @@ def choose_preview_path(entry, show_raw):
     return entry.get("jpg_path") or entry.get("raw_path") or entry.get("single_path")
 
 
+def preview_error_message(file_path, error_text=""):
+    suffix = Path(file_path).suffix.lower()
+    if suffix in {".heic", ".heif"}:
+        return (
+            "HEIC preview is not supported by this Qt build.\n"
+            "Install the Windows HEIF image extension (or a HEIF codec) and restart, "
+            "or convert the file to JPG."
+        )
+    message = f"Could not load image\n{Path(file_path).name}"
+    if error_text:
+        message += f"\n{error_text}"
+    return message
+
+
+def copy_file_safely(source_path, target_path, replace):
+    source = Path(source_path)
+    target = Path(target_path)
+    if paths_are_same(source, target):
+        raise ValueError("Source and destination are the same file")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if not replace and not target.exists():
+        shutil.copy2(source, target)
+        return
+
+    # Copy next to the target first and swap atomically, so a failed or
+    # interrupted copy never destroys the file that is being replaced.
+    temp_path = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        shutil.copy2(source, temp_path)
+        os.replace(temp_path, target)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                LOGGER.warning("Could not remove temporary file %s", temp_path)
+
+
+def move_file_safely(source_path, target_path, replace):
+    source = Path(source_path)
+    target = Path(target_path)
+    if paths_are_same(source, target):
+        raise ValueError("Source and destination are the same file")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if replace or not target.exists():
+        try:
+            os.replace(source, target)
+            return
+        except OSError:
+            # Different volume or a locked target: fall back to copy+delete.
+            pass
+
+    copy_file_safely(source, target, True)
+    try:
+        source.unlink()
+    except OSError:
+        LOGGER.warning("Copied %s but could not remove the source file", source)
+
+
 class SettingsManager:
     def __init__(self):
         legacy_path = Path(sys.argv[0]).resolve().with_name("settings.json")
@@ -1290,6 +1351,8 @@ class ImageTableModel(QAbstractTableModel):
         self.sort_order = Qt.AscendingOrder
         self.defer_sort = False
         self._row_index = {}
+        self.thumbnails = OrderedDict()
+        self.max_thumbnails = 512
 
     def _rebuild_row_index(self):
         self._row_index = {
@@ -1297,6 +1360,29 @@ class ImageTableModel(QAbstractTableModel):
             for row, entry in enumerate(self.entries)
             if entry.get("entry_id")
         }
+
+    def set_thumbnail_limit(self, max_thumbnails):
+        self.max_thumbnails = max(64, int(max_thumbnails))
+        self._trim_thumbnails()
+
+    def set_thumbnail(self, entry_id, pixmap):
+        if not entry_id or pixmap is None or pixmap.isNull():
+            return
+        self.thumbnails[entry_id] = pixmap
+        self.thumbnails.move_to_end(entry_id)
+        self._trim_thumbnails()
+
+    def thumbnail_for(self, entry_id):
+        if not entry_id:
+            return None
+        pixmap = self.thumbnails.get(entry_id)
+        if pixmap is not None:
+            self.thumbnails.move_to_end(entry_id)
+        return pixmap
+
+    def _trim_thumbnails(self):
+        while len(self.thumbnails) > self.max_thumbnails:
+            self.thumbnails.popitem(last=False)
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.entries)
@@ -1330,7 +1416,7 @@ class ImageTableModel(QAbstractTableModel):
             return Qt.Checked if entry.get("entry_id") in self.checked_entry_ids else Qt.Unchecked
         if column == 1:
             if role == Qt.DecorationRole:
-                return entry.get("thumbnail")
+                return self.thumbnail_for(entry.get("entry_id"))
             return None
         if role not in (Qt.DisplayRole, Qt.EditRole):
             if role == Qt.UserRole + 1:
@@ -1373,6 +1459,7 @@ class ImageTableModel(QAbstractTableModel):
         self.entries.clear()
         self.checked_entry_ids.clear()
         self._row_index.clear()
+        self.thumbnails.clear()
         self.endResetModel()
 
     def add_entries(self, entries, apply_sort=True):
@@ -1404,7 +1491,8 @@ class ImageTableModel(QAbstractTableModel):
         entry = self.entries[row]
         entry["exif"] = exif_data or {}
         if thumbnail_image and not thumbnail_image.isNull():
-            entry["thumbnail"] = QPixmap.fromImage(thumbnail_image)
+            self.set_thumbnail(entry_id, QPixmap.fromImage(thumbnail_image))
+            entry["thumbnail"] = None
         if not self.defer_sort and self.sort_column in (3, 4, 5, 6, 7, 8, 9):
             if self.apply_current_sort():
                 return
@@ -1449,8 +1537,10 @@ class ImageTableModel(QAbstractTableModel):
         if column == 0:
             return (entry.get("entry_id") not in self.checked_entry_ids, self.filename_key(entry))
         if column == 1:
-            thumbnail = entry.get("thumbnail")
-            has_thumbnail = bool(thumbnail is not None and not thumbnail.isNull())
+            thumbnail = self.thumbnails.get(entry.get("entry_id"))
+            if thumbnail is None:
+                thumbnail = entry.get("thumbnail")
+            has_thumbnail = thumbnail is not None and not thumbnail.isNull()
             return (not has_thumbnail, self.filename_key(entry))
         if column == 2:
             return self.filename_key(entry)
@@ -1615,6 +1705,7 @@ class ImageLoaderThread(QThread):
 
     def _emit_entries(self, entries):
         batch = []
+        total = len(entries)
         for index, entry in enumerate(entries, start=1):
             if not self.running:
                 return
@@ -1622,9 +1713,10 @@ class ImageLoaderThread(QThread):
             if len(batch) >= 64:
                 self.entries_loaded_signal.emit(batch)
                 batch = []
-            self.progress_signal.emit(index, len(entries))
+            if index == 1 or index % 32 == 0 or index == total:
+                self.progress_signal.emit(index, total)
             if index == 1 or index % 100 == 0:
-                self.status_signal.emit(f"Found {index} of {len(entries)} entries")
+                self.status_signal.emit(f"Found {index} of {total} entries")
         if batch and self.running:
             self.entries_loaded_signal.emit(batch)
 
@@ -1687,7 +1779,7 @@ class MetadataLoaderThread(QThread):
             self._pending_ids.clear()
             self._condition.notify_all()
 
-    def add_entries(self, entries, priority=False):
+    def add_entries(self, entries, priority=False, refresh=False):
         new_entries = []
         with self._condition:
             if not self.running:
@@ -1696,7 +1788,9 @@ class MetadataLoaderThread(QThread):
                 entry_id = entry.get("entry_id")
                 if not entry_id:
                     continue
-                if entry_id in self._pending_ids or entry_id in self._inflight_ids or entry_id in self._completed_ids:
+                if entry_id in self._pending_ids or entry_id in self._inflight_ids:
+                    continue
+                if not refresh and entry_id in self._completed_ids:
                     continue
                 self._pending_ids.add(entry_id)
                 new_entries.append(entry)
@@ -1830,7 +1924,48 @@ class RawPreviewThread(QThread):
             self.error_signal.emit(self.request_id, self.file_path, str(exc))
 
 
+class FileOperationThread(QThread):
+    progress_signal = pyqtSignal(int, int, str)
+    error_signal = pyqtSignal(str, str)
+    completed_signal = pyqtSignal(int, int, bool)
+
+    def __init__(self, jobs, operation_mode):
+        super().__init__()
+        self.jobs = jobs
+        self.operation_mode = operation_mode
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        success_count = 0
+        failed_count = 0
+        total = len(self.jobs)
+        try:
+            for index, (source, target, replace) in enumerate(self.jobs, start=1):
+                if self._cancelled:
+                    break
+                self.progress_signal.emit(index, total, Path(source).name)
+                try:
+                    if self.operation_mode == "copy":
+                        copy_file_safely(source, target, replace)
+                    else:
+                        move_file_safely(source, target, replace)
+                    success_count += 1
+                except Exception as exc:
+                    failed_count += 1
+                    LOGGER.warning("Failed while %sing %s", self.operation_mode, source, exc_info=True)
+                    self.error_signal.emit(source, str(exc))
+        except Exception:
+            LOGGER.exception("File operation thread failed")
+        finally:
+            self.completed_signal.emit(success_count, failed_count, self._cancelled)
+
+
 class MainWindow(QMainWindow):
+    THUMBNAIL_MEMORY_BUDGET = 32 * 1024 * 1024
+
     def __init__(self):
         super().__init__()
         self.settings_manager = SettingsManager()
@@ -1841,6 +1976,14 @@ class MainWindow(QMainWindow):
         self.show_raw = False
         self.loading_in_progress = False
         self.file_operation_active = False
+        self.file_operation_thread = None
+        self.operation_dialog = None
+        self._operation_errors = []
+        self._operation_skipped = 0
+        self._operation_mode = "copy"
+        self._operation_destination = ""
+        self._operation_total = 0
+        self._close_after_operation = False
         self.preview_request_id = 0
         self.preview_thread = None
         self.preview_threads = set()
@@ -1902,6 +2045,7 @@ class MainWindow(QMainWindow):
         self.list_view.setModel(self.list_model)
 
         thumb_size = self.settings_manager.get_setting("thumbnail_size")
+        self.list_model.set_thumbnail_limit(self.thumbnail_limit_for(thumb_size))
         self.thumbnail_delegate = ThumbnailDelegate(thumb_size, self.list_view)
         self.checkbox_delegate = Win11CheckBoxDelegate(lambda: self._is_dark_mode, self.list_view)
         self.list_view.setItemDelegateForColumn(0, self.checkbox_delegate)
@@ -1981,6 +2125,11 @@ class MainWindow(QMainWindow):
         self.resize_timer = QTimer(self)
         self.resize_timer.setSingleShot(True)
         self.resize_timer.timeout.connect(self.reload_preview_after_resize)
+
+    def thumbnail_limit_for(self, thumbnail_size):
+        """Number of thumbnails kept in memory before the LRU cache evicts."""
+        bytes_per_thumbnail = max(int(thumbnail_size), 32) ** 2 * 4
+        return max(256, self.THUMBNAIL_MEMORY_BUDGET // bytes_per_thumbnail)
 
     def setup_table_headers(self):
         self.list_view.horizontalHeader().setSortIndicatorShown(True)
@@ -2241,6 +2390,7 @@ class MainWindow(QMainWindow):
         self._is_dark_mode = theme_is_dark(settings["dark_mode"])
         self.process_button.setText(settings["operation_mode"].capitalize())
         self.thumbnail_delegate.set_thumbnail_size(settings["thumbnail_size"])
+        self.list_model.set_thumbnail_limit(self.thumbnail_limit_for(settings["thumbnail_size"]))
         self.list_view.verticalHeader().setDefaultSectionSize(settings["thumbnail_size"] + 8)
         self.setup_table_headers()
         self.apply_theme()
@@ -2400,8 +2550,15 @@ class MainWindow(QMainWindow):
         return [self.list_model.entry_at(row) for row in range(start_row, end_row + 1) if self.list_model.entry_at(row)]
 
     def queue_visible_metadata(self):
-        if self.metadata_thread and self.metadata_thread.isRunning():
-            self.metadata_thread.add_entries(self.visible_entries(), priority=True)
+        if not (self.metadata_thread and self.metadata_thread.isRunning()):
+            return
+        entries = self.visible_entries()
+        self.metadata_thread.add_entries(entries, priority=True)
+        missing = [entry for entry in entries if self.list_model.thumbnail_for(entry.get("entry_id")) is None]
+        if missing:
+            # Thumbnails are kept in a bounded cache; regenerate the ones that
+            # were evicted while scrolling.
+            self.metadata_thread.add_entries(missing, priority=True, refresh=True)
 
     def loading_finished(self):
         if not self._is_current_loader():
@@ -2585,7 +2742,7 @@ class MainWindow(QMainWindow):
         if request_id != self.preview_request_id or file_path != self.current_image_path:
             return
         LOGGER.warning("Could not load preview for %s: %s", file_path, error_text)
-        self.preview_label.setText(f"Could not load image\n{Path(file_path).name}")
+        self.preview_label.setText(preview_error_message(file_path, error_text))
         self.preview_label.setPixmap(QPixmap())
 
     def cleanup_preview_thread(self):
@@ -2692,53 +2849,46 @@ class MainWindow(QMainWindow):
         return str(unique_path), replace_all, skip_all, False
 
     def copy_file_safely(self, source_path, target_path, replace):
-        source = Path(source_path)
-        target = Path(target_path)
-        if paths_are_same(source, target):
-            raise ValueError("Source and destination are the same file")
-        target.parent.mkdir(parents=True, exist_ok=True)
-
-        if not replace and not target.exists():
-            shutil.copy2(source, target)
-            return
-
-        # Copy next to the target first and swap atomically, so a failed or
-        # interrupted copy never destroys the file that is being replaced.
-        temp_path = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-        try:
-            shutil.copy2(source, temp_path)
-            os.replace(temp_path, target)
-        finally:
-            if temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except OSError:
-                    LOGGER.warning("Could not remove temporary file %s", temp_path)
+        copy_file_safely(source_path, target_path, replace)
 
     def move_file_safely(self, source_path, target_path, replace):
-        source = Path(source_path)
-        target = Path(target_path)
-        if paths_are_same(source, target):
-            raise ValueError("Source and destination are the same file")
-        target.parent.mkdir(parents=True, exist_ok=True)
-
-        if replace or not target.exists():
-            try:
-                os.replace(source, target)
-                return
-            except OSError:
-                # Different volume or a locked target: fall back to copy+delete.
-                pass
-
-        self.copy_file_safely(source, target, True)
-        try:
-            source.unlink()
-        except OSError:
-            LOGGER.warning("Copied %s but could not remove the source file", source)
+        move_file_safely(source_path, target_path, replace)
 
     def set_operation_state(self, enabled):
         for button in self.buttons:
             button.setEnabled(enabled)
+
+    def build_file_operation_plan(self, selected_rows, destination, rename_files):
+        """Resolve every destination path on the UI thread.
+
+        Conflict handling needs dialogs, which must run on the UI thread, so
+        the plan is resolved first and only the copying itself runs in
+        FileOperationThread.
+        """
+        jobs = []
+        skipped_count = 0
+        replace_all = False
+        skip_all = False
+        for _, entry in selected_rows:
+            entry_exif = entry.get("exif") or {}
+            if rename_files and not entry_exif.get("datetime_original"):
+                metadata_path = choose_preview_path(entry, show_raw=False)
+                if metadata_path:
+                    entry_exif = self.get_cached_exif(metadata_path)
+            for file_path in entry.get("all_paths", []):
+                target_path, replace_all, skip_all, should_replace = self.resolve_destination_path(
+                    file_path,
+                    destination,
+                    rename_files,
+                    entry_exif,
+                    replace_all,
+                    skip_all,
+                )
+                if not target_path:
+                    skipped_count += 1
+                    continue
+                jobs.append((file_path, target_path, should_replace))
+        return jobs, skipped_count
 
     def process_selected_files(self):
         if self.file_operation_active:
@@ -2769,84 +2919,77 @@ class MainWindow(QMainWindow):
             ).exec_()
             return
 
-        total_files = sum(len(entry.get("all_paths", [])) for _, entry in selected_rows)
-        if not total_files:
-            QMessageBox.warning(self, "No Files", "The selected entries do not contain any files.")
+        jobs, skipped_count = self.build_file_operation_plan(selected_rows, destination, rename_files)
+        if not jobs:
+            Win11MessageBox(
+                self,
+                "Nothing To Do",
+                f"All {skipped_count} file(s) were skipped.",
+                QMessageBox.Ok,
+                QMessageBox.Information,
+            ).exec_()
             return
 
         self.file_operation_active = True
         self.set_operation_state(False)
-        progress = FileOperationDialog(self, operation_mode, total_files)
-        progress.show()
-        QApplication.processEvents()
+        self._operation_errors = []
+        self._operation_skipped = skipped_count
+        self._operation_mode = operation_mode
+        self._operation_destination = destination
+        self._operation_total = len(jobs)
 
-        replace_all = False
-        skip_all = False
-        processed_count = 0
-        success_count = 0
-        failed_count = 0
-        skipped_count = 0
-        moved_anything = False
-        cancelled = False
+        self.operation_dialog = FileOperationDialog(self, operation_mode, len(jobs))
+        self.operation_dialog.show()
 
-        try:
-            for _, entry in selected_rows:
-                if cancelled:
-                    break
-                entry_exif = entry.get("exif") or {}
-                if rename_files and not entry_exif.get("datetime_original"):
-                    metadata_path = choose_preview_path(entry, show_raw=False)
-                    if metadata_path:
-                        entry_exif = self.get_cached_exif(metadata_path)
-                for file_path in entry.get("all_paths", []):
-                    if progress.is_cancelled():
-                        cancelled = True
-                        break
+        thread = FileOperationThread(jobs, operation_mode)
+        self.file_operation_thread = thread
+        thread.progress_signal.connect(self.update_operation_progress)
+        thread.error_signal.connect(self.collect_operation_error)
+        thread.completed_signal.connect(self.finish_file_operation)
+        thread.finished.connect(self.cleanup_file_operation)
+        self.operation_dialog.cancel_button.clicked.connect(self.cancel_file_operation)
+        thread.start()
 
-                    processed_count += 1
-                    progress.update_status(processed_count, total_files, Path(file_path).name)
-                    QApplication.processEvents()
+    def cancel_file_operation(self):
+        if self.file_operation_thread and self.file_operation_thread.isRunning():
+            self.file_operation_thread.cancel()
+        if self.operation_dialog:
+            self.operation_dialog.cancel()
+        self.statusBar().showMessage("Cancelling file operation...", 3000)
 
-                    target_path, replace_all, skip_all, should_replace = self.resolve_destination_path(
-                        file_path,
-                        destination,
-                        rename_files,
-                        entry_exif,
-                        replace_all,
-                        skip_all,
-                    )
-                    if not target_path:
-                        skipped_count += 1
-                        continue
+    def update_operation_progress(self, current, total, file_name):
+        if self.operation_dialog:
+            self.operation_dialog.update_status(current, total, file_name)
 
-                    try:
-                        if operation_mode == "copy":
-                            self.copy_file_safely(file_path, target_path, should_replace)
-                        else:
-                            self.move_file_safely(file_path, target_path, should_replace)
-                            moved_anything = True
-                        success_count += 1
-                    except Exception:
-                        failed_count += 1
-                        LOGGER.warning("Failed while %sing %s", operation_mode, file_path, exc_info=True)
-                        Win11MessageBox(
-                            self,
-                            "Error",
-                            f"Error while {operation_mode}ing {Path(file_path).name}. See log for details.",
-                            QMessageBox.Ok,
-                            QMessageBox.Critical,
-                        ).exec_()
-        finally:
-            progress.close()
-            self.file_operation_active = False
-            self.set_operation_state(True)
+    def collect_operation_error(self, file_path, error_text):
+        self._operation_errors.append((file_path, error_text))
 
-        if moved_anything:
+    def cleanup_file_operation(self):
+        thread = self.sender()
+        if thread is self.file_operation_thread:
+            self.file_operation_thread = None
+
+    def finish_file_operation(self, success_count, failed_count, cancelled):
+        thread = self.sender()
+        if thread is not None and thread is not self.file_operation_thread:
+            return
+        if self.operation_dialog:
+            self.operation_dialog.close()
+            self.operation_dialog = None
+
+        mode = self._operation_mode
+        destination = self._operation_destination
+        total = self._operation_total
+        skipped_count = self._operation_skipped
+        self.file_operation_active = False
+        self.set_operation_state(True)
+
+        if mode == "move" and success_count:
             self.load_image_files(self.current_folder)
 
-        operation_past = "copied" if operation_mode == "copy" else "moved"
+        operation_past = "copied" if mode == "copy" else "moved"
         if cancelled:
-            summary = f"Cancelled after {success_count} of {total_files} file(s)."
+            summary = f"Cancelled after {success_count} of {total} file(s)."
         else:
             summary = f"{success_count} file(s) {operation_past} to {destination}."
         if skipped_count:
@@ -2860,6 +3003,10 @@ class MainWindow(QMainWindow):
             QMessageBox.Ok,
             QMessageBox.Information if not failed_count else QMessageBox.Warning,
         ).exec_()
+
+        if self._close_after_operation:
+            self._close_after_operation = False
+            QTimer.singleShot(0, self.close)
 
     def edit_current_image(self):
         if not self.current_image_path:
@@ -2917,8 +3064,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self.file_operation_active:
+            self._close_after_operation = True
+            self.cancel_file_operation()
+            self.statusBar().showMessage("Cancelling the file operation before closing...", 3000)
             event.ignore()
-            self.statusBar().showMessage("A file operation is still running. Please wait.", 3000)
             return
 
         self._closing = True

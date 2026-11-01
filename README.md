@@ -33,19 +33,21 @@ Image Picker scans common image formats including:
 
 RAW support depends on `rawpy` and the camera format being supported by LibRaw.
 
+HEIC files are listed and can be selected, copied, or moved, but Qt can only preview them when a HEIF codec is installed (on Windows that is the HEIF Image Extension from the Microsoft Store). Without the codec the preview pane explains how to enable it.
+
 ## Requirements
 
 - Windows is the primary target platform.
-- Python 3.14 is recommended. Python 3.13 is also known to work.
+- Python 3.13 and Python 3.14 both work with the pinned dependency versions.
 - Python packages listed in `requirements.txt`:
 
 ```text
-PyQt5
-darkdetect
-exifread
-numpy
-rawpy
-win32mica; platform_system == "Windows"
+PyQt5==5.15.11
+darkdetect==0.8.0
+ExifRead==3.5.1
+numpy==2.5.4
+rawpy==0.28.0
+win32mica==3.0; platform_system == "Windows"
 ```
 
 ## Setup
@@ -53,9 +55,9 @@ win32mica; platform_system == "Windows"
 Create a virtual environment and install dependencies:
 
 ```powershell
-py -3.14 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+py -3.13 -m venv .venv313
+.\.venv313\Scripts\python.exe -m pip install --upgrade pip
+.\.venv313\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 ## Running
@@ -119,6 +121,8 @@ Important performance choices:
 - JPG preview and thumbnails use `QImageReader.setScaledSize()` to avoid decoding more image data than needed.
 - Both JPG and RAW previews are decoded in worker threads, so scrolling and resizing stay responsive.
 - Row lookups use an `entry_id` index instead of scanning the whole list for every metadata update.
+- Thumbnails live in a bounded LRU cache (32 MB budget, adjusted to the thumbnail size) instead of one pixmap per file, so memory stays flat for folders with tens of thousands of images.
+- Copy and move run in a worker thread. Destination conflicts are resolved on the UI thread first, then the file transfer happens without blocking the window.
 
 ## Safety Notes
 
@@ -126,11 +130,33 @@ Important performance choices:
 - Replacing an existing destination file copies to a temporary file first and swaps it in atomically, so a failed copy does not destroy the old file.
 - Moving into the folder that is already loaded is refused, because it would delete the files you are looking at.
 - Worker threads are cancelled cooperatively; the app no longer calls `QThread.terminate()`.
+- Closing the window during a copy/move cancels the operation and closes once it has stopped safely.
+
+## Tests
+
+The test suite uses the offscreen Qt platform, so it runs without opening windows:
+
+```powershell
+.\.venv313\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+```
+
+`tests/test_imagepicker035.py` covers folder scanning, RAW/JPG pairing, table model sorting, same-folder copy/move safety, atomic replacement, the file operation thread, stale loader signals and the settings fallback.
+
+## Building a Windows executable
+
+```powershell
+.\.venv313\Scripts\python.exe -m pip install pyinstaller
+.\.venv313\Scripts\pyinstaller.exe --noconfirm ImagePicker035.spec
+```
+
+The one-file executable is written to `dist/`. `ImagePicker035.spec` bundles `icons/` and the application icon.
 
 ## Project Files
 
 - `ImagePicker035.py`: Current application version.
-- `requirements.txt`: Runtime dependencies.
+- `tests/test_imagepicker035.py`: Test suite for the current version.
+- `ImagePicker035.spec`: PyInstaller build definition.
+- `requirements.txt`: Runtime dependencies (pinned).
 - `icons/`: UI icons used by the application.
 - `agents.md`: Development/task log for this project.
 - `TODO.md`: Historical prioritized technical TODO list.

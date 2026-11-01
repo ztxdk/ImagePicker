@@ -122,3 +122,9 @@ Denne fil logger alle handlinger udfort i forbindelse med den aktuelle opgave.
 115. `README.md` blev opdateret til version 035 med nye performance-, sikkerheds- og konfigurationsnoter, `ImagePicker035.spec` blev oprettet, og `.gitignore` blev justeret saa kun version 035 er aktiv i repoet.
 116. Konfigurationsstien blev verificeret empirisk: `setOrganizationName` gav en dobbelt `ImagePicker\ImagePicker`-mappe, saa organisation-navnet blev fjernet og baade log og settings ligger nu i `%LOCALAPPDATA%\ImagePicker`, med gamle settings som fallback.
 117. Preview ved vindues-resize blev justeret til foerst en hurtig lav-kvalitets-render og derefter en automatisk skarp genrendering efter 400 ms for ikke-RAW billeder.
+118. Filkopiering og flytning blev flyttet til `FileOperationThread`: konflikter afklares paa UI-traaden i en plan, mens selve overfoerslen koerer i baggrunden med progress, fejlopsamling og cancel.
+119. Thumbnails blev flyttet fra ét `QPixmap` pr. raekke til en begraenset LRU-cache paa 32 MB, og metadata-traaden kan nu genopbygge thumbnails der er blevet evicted under scrolling.
+120. HEIC-previewfejl faar nu en forklarende besked om manglende HEIF-codec i stedet for en generisk fejl, og `preview_error_message` blev tilfoejet.
+121. `requirements.txt` blev versionslaast, og de pinned versioner blev verificeret i et midlertidigt Python 3.14-miljoe.
+122. `tests/test_imagepicker035.py` blev udvidet til 38 tests med filoperationstraaden, thumbnail-eviction, HEIC-besked og refresh af completed metadata.
+123. `tests/`, `ImagePicker035.spec` og den pinned `requirements.txt` blev gjort til en del af repoet, og `.gitignore` blev justeret saa kun historiske testfiler og version 034 ignoreres.
