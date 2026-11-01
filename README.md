@@ -2,7 +2,7 @@
 
 Image Picker is a desktop photo culling tool for quickly reviewing a folder of images and selecting the files you want to keep, copy, move, or edit externally.
 
-The current development version is `ImagePicker034.py`.
+The current development version is `ImagePicker035.py`.
 
 This project is vibe coded: it was built iteratively with AI assistance and practical testing, with the goal of making the photo selection workflow fast and useful.
 
@@ -10,13 +10,15 @@ This project is vibe coded: it was built iteratively with AI assistance and prac
 
 - Fast folder loading for large photo sets.
 - Progressive metadata and thumbnail loading so the UI becomes usable quickly.
+- Sortable columns: filename (natural order), EXIF date, shutter speed, ISO, focal length, and lens.
 - RAW/JPG pairing, with paired files shown as one row when enabled.
-- JPG and RAW preview support.
+- JPG and RAW preview support, both decoded off the UI thread.
 - Mouse wheel navigation over the preview image.
 - `Space` or middle mouse click toggles selection for the current image.
-- Copy or move selected images to a destination folder.
+- Copy or move selected images to a destination folder, with safe overwrite handling.
 - Optional EXIF-based renaming using `YYYYMMDD-HHMMSS`.
 - Optional subfolder scanning.
+- Remembers the last opened folder between runs.
 - Light, dark, or automatic theme mode.
 - Resizable table/preview layout using the splitter between them.
 - External editor integration, including configurable edit working directory.
@@ -61,10 +63,10 @@ py -3.14 -m venv .venv
 Run the latest version:
 
 ```powershell
-.\.venv312\Scripts\python.exe .\ImagePicker034.py
+.\.venv313\Scripts\python.exe .\ImagePicker035.py
 ```
 
-Older version files are kept in local history and Git history, but only `ImagePicker034.py` is kept as the active Python source file in the repository.
+Older version files are kept in local history and Git history, but only `ImagePicker035.py` is kept as the active Python source file in the repository.
 
 ## Basic Workflow
 
@@ -101,25 +103,33 @@ The settings dialog includes:
 - External editor path.
 - Edit working directory.
 
-Settings and logs are stored in the application config directory returned by Qt's `QStandardPaths.AppConfigLocation`, with a fallback to `~/.image_picker/ImagePicker`.
+Settings and logs are stored in the application config directory returned by Qt's `QStandardPaths.AppConfigLocation` (`%LOCALAPPDATA%\ImagePicker` on Windows), with a fallback to `~/.image_picker/ImagePicker`. Older settings files next to the script or in the previous `Image Picker\ImagePicker` folder are still read as a fallback, and the log file rotates at 2 MB with three backups.
 
 ## Performance Notes
 
-Version 034 is optimized for one-off photo culling sessions on new folders. It intentionally does not use a persistent cache between application runs.
+Version 035 is optimized for one-off photo culling sessions on new folders. It intentionally does not use a persistent cache between application runs.
 
 Important performance choices:
 
-- The initial scan only builds the file list and RAW/JPG grouping.
-- Rows are inserted into the table in batches.
+- The initial scan walks folders with `os.scandir` and skips unreadable or symlinked directories instead of aborting.
+- Rows are inserted into the table in batches while scanning when RAW/JPG pairing is disabled.
 - EXIF and thumbnails are loaded asynchronously after rows appear.
 - Visible and nearby rows are prioritized.
 - Selected/current images are prioritized over background work.
 - JPG preview and thumbnails use `QImageReader.setScaledSize()` to avoid decoding more image data than needed.
-- Worker threads use `QImage`; `QPixmap` is created on the UI side.
+- Both JPG and RAW previews are decoded in worker threads, so scrolling and resizing stay responsive.
+- Row lookups use an `entry_id` index instead of scanning the whole list for every metadata update.
+
+## Safety Notes
+
+- Copying or moving into the source folder can never overwrite or delete the original file.
+- Replacing an existing destination file copies to a temporary file first and swaps it in atomically, so a failed copy does not destroy the old file.
+- Moving into the folder that is already loaded is refused, because it would delete the files you are looking at.
+- Worker threads are cancelled cooperatively; the app no longer calls `QThread.terminate()`.
 
 ## Project Files
 
-- `ImagePicker034.py`: Current optimized application version.
+- `ImagePicker035.py`: Current application version.
 - `requirements.txt`: Runtime dependencies.
 - `icons/`: UI icons used by the application.
 - `agents.md`: Development/task log for this project.

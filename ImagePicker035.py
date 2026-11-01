@@ -1,13 +1,14 @@
-import ctypes
 import datetime
 import json
 import logging
+import logging.handlers
 import os
 import platform
 import re
 import shutil
 import subprocess
 import sys
+import threading
 from collections import OrderedDict, deque
 from pathlib import Path
 
@@ -15,7 +16,7 @@ import darkdetect
 import exifread
 import numpy as np
 import rawpy
-from PyQt5.QtCore import QAbstractTableModel, QEvent, QItemSelectionModel, QModelIndex, QPoint, QRect, QSize, Qt, QThread, QTimer, QStandardPaths, pyqtSignal
+from PyQt5.QtCore import QAbstractTableModel, QCoreApplication, QEvent, QItemSelectionModel, QModelIndex, QPoint, QRect, QSize, Qt, QThread, QTimer, QStandardPaths, pyqtSignal
 from PyQt5.QtGui import (
     QColor,
     QIcon,
@@ -25,7 +26,6 @@ from PyQt5.QtGui import (
     QPen,
     QPixmap,
     QPolygon,
-    QTransform,
 )
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -35,6 +35,7 @@ from PyQt5.QtWidgets import (
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -46,11 +47,13 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QProgressBar,
     QRadioButton,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
     QSpinBox,
     QStyledItemDelegate,
     QStyle,
+    QStyleOptionViewItem,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -65,14 +68,24 @@ except ImportError:  # pragma: no cover - optional dependency on some systems
 
 
 APP_NAME = "Image Picker"
-APP_VERSION = "0.34"
-APP_DISPLAY_NAME = f"{APP_NAME} - v{APP_VERSION} (2026-07-05)"
+APP_ID = "ImagePicker"
+APP_VERSION = "0.35"
+APP_DISPLAY_NAME = f"{APP_NAME} - v{APP_VERSION}"
 RAW_EXTENSIONS = {".arw", ".raw", ".cr2", ".nef", ".dng"}
 JPEG_EXTENSIONS = {".jpg", ".jpeg"}
 IMAGE_EXTENSIONS = JPEG_EXTENSIONS | RAW_EXTENSIONS | {".png", ".tif", ".tiff", ".bmp", ".webp", ".heic"}
 MAX_EXIF_CACHE = 4096
-MAX_THUMB_CACHE = 1024
 MAX_RAW_CACHE = 16
+
+
+def ensure_application_identity():
+    """Set the Qt application identity before anything reads QStandardPaths.
+
+    Both the log file and the settings file derive their location from this, so
+    it has to be configured at import time rather than in main().
+    """
+    QCoreApplication.setApplicationName(APP_ID)
+    QCoreApplication.setOrganizationName(APP_ID)
 
 
 def is_windows():
@@ -93,13 +106,19 @@ def theme_is_dark(setting_value):
 
 
 def get_app_config_dir():
+    ensure_application_identity()
     base_dir = QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation)
     if not base_dir:
-        base_dir = str(Path.home() / ".image_picker")
-    base_path = Path(base_dir)
-    if base_path.name.lower() != "imagepicker":
-        base_path = base_path / "ImagePicker"
-    base_path.mkdir(parents=True, exist_ok=True)
+        base_path = Path.home() / ".image_picker" / APP_ID
+    else:
+        base_path = Path(base_dir)
+        if base_path.name.casefold() != APP_ID.casefold():
+            base_path = base_path / APP_ID
+    try:
+        base_path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        base_path = Path.home() / ".image_picker" / APP_ID
+        base_path.mkdir(parents=True, exist_ok=True)
     return base_path
 
 
@@ -107,23 +126,37 @@ def setup_logging():
     log_dir = get_app_config_dir()
     log_file = log_dir / "image_picker.log"
     logger = logging.getLogger("image_picker")
-    if logger.handlers:
-        return logger
-
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    has_file_handler = any(
+        isinstance(handler, logging.handlers.RotatingFileHandler)
+        and Path(handler.baseFilename) == log_file
+        for handler in logger.handlers
+    )
+    if not has_file_handler:
+        try:
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+            )
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        except OSError:
+            pass
 
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
+    has_stream_handler = any(
+        isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler)
+        for handler in logger.handlers
+    )
+    if not has_stream_handler:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
 
     return logger
 
 
+ensure_application_identity()
 LOGGER = setup_logging()
 
 
@@ -150,7 +183,16 @@ def trim_cache(cache, max_items):
 
 
 def normalize_path(value):
-    return str(Path(value).resolve()).lower()
+    try:
+        return os.path.normcase(os.path.abspath(str(value)))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def paths_are_same(first_path, second_path):
+    if not first_path or not second_path:
+        return False
+    return normalize_path(first_path) == normalize_path(second_path)
 
 
 def is_raw_file(file_path):
@@ -167,6 +209,26 @@ def parse_exif_datetime(datetime_str):
 
     try:
         return datetime.datetime.strptime(str(datetime_str), "%Y:%m:%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def parse_exposure_seconds(tag_value):
+    """Convert an EXIF exposure value such as "1/250" or "2" to seconds."""
+    text = exif_text(tag_value)
+    if not text:
+        return None
+    if "/" in text:
+        try:
+            num, den = text.split("/", 1)
+            denominator = float(den)
+            if denominator == 0:
+                return None
+            return float(num) / denominator
+        except ValueError:
+            return None
+    try:
+        return float(text.rstrip("s"))
     except ValueError:
         return None
 
@@ -190,16 +252,6 @@ def parse_leading_number(value):
         return float(match.group(0))
     except ValueError:
         return None
-
-
-def extract_orientation(tags):
-    orientation = tags.get("Image Orientation")
-    if not orientation:
-        return 1
-    try:
-        return int(orientation.values[0])
-    except Exception:
-        return 1
 
 
 def format_f_number(tag_value):
@@ -236,11 +288,11 @@ def extract_exif(file_path):
         "time": "",
         "f_stop": "",
         "exposure": "",
+        "exposure_seconds": None,
         "iso": "",
         "focal_length": "",
         "lens_model": "",
         "datetime_original": "",
-        "orientation": 1,
     }
     try:
         with open(file_path, "rb") as file_handle:
@@ -251,19 +303,20 @@ def extract_exif(file_path):
 
         data = defaults.copy()
         data["datetime_original"] = datetime_text
-        data["orientation"] = extract_orientation(tags)
         if dt_obj:
             data["date"] = dt_obj.strftime("%d-%m-%y")
             data["time"] = dt_obj.strftime("%H:%M:%S")
 
         data["f_stop"] = format_f_number(tags.get("EXIF FNumber"))
-        data["exposure"] = exif_text(tags.get("EXIF ExposureTime"))
+        exposure_tag = tags.get("EXIF ExposureTime")
+        data["exposure"] = exif_text(exposure_tag)
+        data["exposure_seconds"] = parse_exposure_seconds(exposure_tag)
         data["iso"] = exif_text(tags.get("EXIF ISOSpeedRatings"))
         data["focal_length"] = format_focal_length(tags.get("EXIF FocalLength"))
-        data["lens_model"] = exif_text(tags.get("EXIF LensModel") or tags.get("Image Model"))
+        data["lens_model"] = exif_text(tags.get("EXIF LensModel"))
         return data
     except Exception:
-        LOGGER.exception("Error extracting EXIF data from %s", file_path)
+        LOGGER.warning("Could not read EXIF data from %s", file_path, exc_info=True)
         return defaults.copy()
 
 
@@ -279,42 +332,6 @@ def exif_filename_from_metadata(exif_data, fallback_stem, rename_format):
     }
     fmt = format_map.get(rename_format, "%Y%m%d-%H%M%S")
     return dt_obj.strftime(fmt)
-
-
-def orientation_transform(orientation_value):
-    transform = QTransform()
-    if orientation_value == 2:
-        transform.scale(-1, 1)
-    elif orientation_value == 3:
-        transform.rotate(180)
-    elif orientation_value == 4:
-        transform.scale(1, -1)
-    elif orientation_value == 5:
-        transform.scale(-1, 1)
-        transform.rotate(270)
-    elif orientation_value == 6:
-        transform.rotate(90)
-    elif orientation_value == 7:
-        transform.scale(-1, 1)
-        transform.rotate(90)
-    elif orientation_value == 8:
-        transform.rotate(270)
-    return transform
-
-
-def apply_orientation(pixmap, orientation_value):
-    if not pixmap or pixmap.isNull() or orientation_value in (None, 1):
-        return pixmap
-    return pixmap.transformed(orientation_transform(orientation_value), Qt.SmoothTransformation)
-
-
-def scaled_pixmap_for_label(pixmap, target_size, smooth=True):
-    if not pixmap or pixmap.isNull():
-        return QPixmap()
-    width = max(target_size.width(), 1)
-    height = max(target_size.height(), 1)
-    transform_mode = Qt.SmoothTransformation if smooth else Qt.FastTransformation
-    return pixmap.scaled(width, height, Qt.KeepAspectRatio, transform_mode)
 
 
 def scaled_image_for_size(image, target_size, smooth=True):
@@ -357,49 +374,67 @@ def create_thumbnail_image(image_path, thumbnail_size):
             return QImage()
         return scaled_image_for_size(image, target)
     except Exception:
-        LOGGER.exception("Error creating thumbnail for %s", image_path)
+        LOGGER.warning("Could not create thumbnail for %s", image_path, exc_info=True)
         return QImage()
 
 
-def create_thumbnail(image_path, thumbnail_size, exif_data=None):
-    try:
-        image = create_thumbnail_image(image_path, thumbnail_size)
-        if image.isNull():
-            return QPixmap()
-        return QPixmap.fromImage(image)
-    except Exception:
-        LOGGER.exception("Error creating thumbnail for %s", image_path)
-        return QPixmap()
+def iter_image_files(directory, include_subfolders, should_continue=None, progress_callback=None):
+    """Yield file records while walking the folder.
+
+    os.scandir keeps this cheap on large folders: each directory entry is
+    stat'ed at most once, unreadable subfolders are skipped instead of aborting
+    the whole scan, and symlinked folders are not followed.
+    """
+    directory_path = Path(directory)
+    pending_dirs = [directory_path]
+    scanned_count = 0
+
+    while pending_dirs:
+        current_dir = pending_dirs.pop()
+        try:
+            with os.scandir(current_dir) as scan_iterator:
+                for entry in scan_iterator:
+                    if should_continue is not None and not should_continue():
+                        return
+                    try:
+                        if entry.is_dir():
+                            if include_subfolders and not entry.is_symlink():
+                                pending_dirs.append(Path(entry.path))
+                            continue
+                        if not entry.is_file():
+                            continue
+                    except OSError:
+                        continue
+
+                    path = Path(entry.path)
+                    if path.suffix.lower() not in IMAGE_EXTENSIONS:
+                        continue
+                    try:
+                        modified_time = entry.stat().st_mtime
+                    except OSError:
+                        modified_time = 0
+                    try:
+                        relative_path = path.relative_to(directory_path)
+                    except ValueError:
+                        relative_path = Path(path.name)
+
+                    scanned_count += 1
+                    if progress_callback is not None and scanned_count % 200 == 0:
+                        progress_callback(scanned_count)
+
+                    yield {
+                        "full_path": str(path),
+                        "display_name": str(relative_path).replace("\\", "/"),
+                        "suffix": path.suffix.lower(),
+                        "group_key": str(relative_path.with_suffix("")).replace("\\", "/").lower(),
+                        "modified_time": modified_time,
+                    }
+        except OSError:
+            LOGGER.warning("Could not scan folder %s", current_dir, exc_info=True)
 
 
 def scan_image_files(directory, include_subfolders, should_continue=None):
-    directory_path = Path(directory)
-    file_records = []
-    if include_subfolders:
-        iterator = directory_path.rglob("*")
-    else:
-        iterator = directory_path.iterdir()
-
-    for path in iterator:
-        if should_continue is not None and not should_continue():
-            break
-        if not path.is_file():
-            continue
-        if path.suffix.lower() not in IMAGE_EXTENSIONS:
-            continue
-        try:
-            display_name = str(path.relative_to(directory_path))
-        except ValueError:
-            display_name = path.name
-        file_records.append(
-            {
-                "full_path": str(path),
-                "display_name": display_name.replace("\\", "/"),
-                "suffix": path.suffix.lower(),
-                "group_key": str(path.relative_to(directory_path).with_suffix("")).replace("\\", "/").lower(),
-                "modified_time": path.stat().st_mtime,
-            }
-        )
+    file_records = list(iter_image_files(directory, include_subfolders, should_continue))
     file_records.sort(key=lambda item: item["display_name"].lower())
     return file_records
 
@@ -414,7 +449,7 @@ def build_single_entry(record):
         "raw_path": path if is_raw_file(path) else None,
         "single_path": None if (is_pairable_jpeg(path) or is_raw_file(path)) else path,
         "modified_time": record.get("modified_time", 0),
-        "thumbnail": QPixmap(),
+        "thumbnail": None,
         "exif": {},
     }
     entry["all_paths"] = [value for value in (entry["jpg_path"], entry["raw_path"], entry["single_path"]) if value]
@@ -435,7 +470,7 @@ def build_grouped_entries(file_records):
                 "raw_path": None,
                 "single_path": None,
                 "modified_time": record.get("modified_time", 0),
-                "thumbnail": QPixmap(),
+                "thumbnail": None,
                 "exif": {},
             },
         )
@@ -490,21 +525,65 @@ class SettingsManager:
         }
         self.current_settings = self.load_settings()
 
+    def legacy_settings_files(self):
+        candidates = [self.legacy_settings_file]
+        generic_dir = QStandardPaths.writableLocation(QStandardPaths.GenericConfigLocation)
+        if generic_dir:
+            # Settings used to live in "<generic config>/Image Picker/ImagePicker"
+            # because the app name contained a space when the directory was resolved.
+            candidates.append(Path(generic_dir) / APP_NAME / APP_ID / "settings.json")
+        seen = set()
+        unique_candidates = []
+        for candidate in candidates:
+            key = normalize_path(candidate)
+            if key in seen or key == normalize_path(self.settings_file):
+                continue
+            seen.add(key)
+            unique_candidates.append(candidate)
+        return unique_candidates
+
     def _read_json_file(self, file_path):
         try:
             with open(file_path, "r", encoding="utf-8") as file_handle:
-                return json.load(file_handle)
+                data = json.load(file_handle)
+                if isinstance(data, dict):
+                    return data
         except Exception:
-            LOGGER.exception("Error loading settings from %s", file_path)
-            return {}
+            LOGGER.warning("Could not load settings from %s", file_path, exc_info=True)
+        return {}
+
+    def _coerce_settings(self, raw_settings):
+        settings = {}
+        for key, default_value in self.default_settings.items():
+            if key not in raw_settings:
+                continue
+            value = raw_settings[key]
+            try:
+                if default_value is None:
+                    settings[key] = None if value is None else bool(value)
+                elif isinstance(default_value, bool):
+                    settings[key] = bool(value)
+                elif isinstance(default_value, int):
+                    settings[key] = int(value)
+                elif isinstance(default_value, float):
+                    settings[key] = float(value)
+                elif isinstance(default_value, list):
+                    settings[key] = list(value) if isinstance(value, (list, tuple)) else default_value
+                else:
+                    settings[key] = "" if value is None else str(value)
+            except (TypeError, ValueError):
+                LOGGER.warning("Ignoring invalid setting %r=%r", key, value)
+        return settings
 
     def load_settings(self):
         settings = self.default_settings.copy()
         if self.settings_file.exists():
-            settings.update(self._read_json_file(self.settings_file))
+            settings.update(self._coerce_settings(self._read_json_file(self.settings_file)))
             return settings
-        if self.legacy_settings_file.exists():
-            settings.update(self._read_json_file(self.legacy_settings_file))
+        for legacy_file in self.legacy_settings_files():
+            if legacy_file.exists():
+                settings.update(self._coerce_settings(self._read_json_file(legacy_file)))
+                break
         return settings
 
     def save_settings(self, settings):
@@ -527,13 +606,27 @@ class SettingsWindow(QDialog):
         super().__init__(parent)
         self.settings_manager = settings_manager
         self.setWindowTitle("Settings")
-        self.setFixedSize(460, 640)
+        self.resize(520, 700)
+        self.setMinimumSize(460, 420)
 
         layout = QVBoxLayout(self)
-        layout.setSpacing(16)
-        layout.setContentsMargins(12, 16, 12, 16)
+        layout.setSpacing(12)
+        layout.setContentsMargins(12, 12, 12, 12)
 
-        self.create_settings_controls(layout)
+        scroll_area = QScrollArea(self)
+        scroll_area.setObjectName("settingsScroll")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content_widget = QWidget()
+        content_widget.setObjectName("settingsContent")
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setSpacing(16)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        self.create_settings_controls(content_layout)
+        content_layout.addStretch(1)
+        scroll_area.setWidget(content_widget)
+        layout.addWidget(scroll_area, 1)
 
         button_layout = QHBoxLayout()
         self.save_button = QPushButton("Save")
@@ -688,23 +781,23 @@ class SettingsWindow(QDialog):
         else:
             dark_mode = theme_index == 2
 
-        settings = {
-            "default_source_folder": self.source_input.text().strip(),
-            "destination_folder": self.dest_input.text().strip(),
-            "operation_mode": "move" if self.move_radio.isChecked() else "copy",
-            "dark_mode": dark_mode,
-            "thumbnail_size": self.thumb_spin.value(),
-            "raw_preview_quality": self.raw_combo.currentText().lower(),
-            "raw_gamma": self.gamma_spin.value(),
-            "auto_select_pairs": self.pair_checkbox.isChecked(),
-            "rename_files": self.rename_checkbox.isChecked(),
-            "rename_format": "YYYYMMDD-HHMMSS",
-            "include_subfolders": self.subfolder_checkbox.isChecked(),
-            "editor_path": self.editor_path_input.text().strip(),
-            "edit_directory": self.work_dir_input.text().strip(),
-            "save_edits_format": "jpg",
-            "editor_presets": [],
-        }
+        settings = self.settings_manager.current_settings.copy()
+        settings.update(
+            {
+                "default_source_folder": self.source_input.text().strip(),
+                "destination_folder": self.dest_input.text().strip(),
+                "operation_mode": "move" if self.move_radio.isChecked() else "copy",
+                "dark_mode": dark_mode,
+                "thumbnail_size": self.thumb_spin.value(),
+                "raw_preview_quality": self.raw_combo.currentText().lower(),
+                "raw_gamma": round(self.gamma_spin.value(), 1),
+                "auto_select_pairs": self.pair_checkbox.isChecked(),
+                "rename_files": self.rename_checkbox.isChecked(),
+                "include_subfolders": self.subfolder_checkbox.isChecked(),
+                "editor_path": self.editor_path_input.text().strip(),
+                "edit_directory": self.work_dir_input.text().strip(),
+            }
+        )
         if self.settings_manager.save_settings(settings):
             self.accept()
             return
@@ -742,6 +835,10 @@ class SettingsWindow(QDialog):
                 """
                 QDialog { background-color: #2b2b2b; color: #ffffff; }
                 QLabel, QGroupBox { color: #ffffff; }
+                QScrollArea, QScrollArea > QWidget > QWidget, #settingsContent {
+                    background-color: #2b2b2b;
+                    border: none;
+                }
                 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
                     background-color: #1e1e1e;
                     color: #ffffff;
@@ -806,6 +903,10 @@ class SettingsWindow(QDialog):
             self.setStyleSheet(
                 """
                 QDialog { background-color: #f9f9f9; color: #000000; }
+                QScrollArea, QScrollArea > QWidget > QWidget, #settingsContent {
+                    background-color: #f9f9f9;
+                    border: none;
+                }
                 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
                     background-color: #ffffff;
                     color: #000000;
@@ -1085,12 +1186,22 @@ class Win11MessageBox(QDialog):
         self.setMinimumWidth(420)
 
         layout = QVBoxLayout(self)
+        content_layout = QHBoxLayout()
+        icon_pixmap = self.standard_icon(icon)
+        if icon_pixmap is not None:
+            icon_label = QLabel()
+            icon_label.setPixmap(icon_pixmap.pixmap(32, 32))
+            icon_label.setAlignment(Qt.AlignTop)
+            content_layout.addWidget(icon_label)
         self.message_label = QLabel(message)
         self.message_label.setWordWrap(True)
-        layout.addWidget(self.message_label)
+        self.message_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        content_layout.addWidget(self.message_label, 1)
+        layout.addLayout(content_layout)
 
         button_layout = QHBoxLayout()
         self.buttons = []
+        self.button_ids = []
         for button_id, label in (
             (QMessageBox.Yes, "Yes"),
             (QMessageBox.YesToAll, "Yes to All"),
@@ -1102,10 +1213,33 @@ class Win11MessageBox(QDialog):
                 button = QPushButton(label)
                 button.clicked.connect(lambda _, value=button_id: self.done(value))
                 self.buttons.append(button)
+                self.button_ids.append(button_id)
                 button_layout.addWidget(button)
         layout.addLayout(button_layout)
+        layout.addStretch(1)
 
         self.apply_theme()
+
+    def standard_icon(self, icon):
+        icon_map = {
+            QMessageBox.Information: QStyle.SP_MessageBoxInformation,
+            QMessageBox.Warning: QStyle.SP_MessageBoxWarning,
+            QMessageBox.Critical: QStyle.SP_MessageBoxCritical,
+            QMessageBox.Question: QStyle.SP_MessageBoxQuestion,
+        }
+        standard_id = icon_map.get(icon)
+        if standard_id is None:
+            return None
+        return self.style().standardIcon(standard_id)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            if QMessageBox.No in self.button_ids:
+                self.done(QMessageBox.No)
+            else:
+                self.done(QMessageBox.Rejected)
+            return
+        super().keyPressEvent(event)
 
     def apply_theme(self):
         parent_window = self.parent()
@@ -1145,7 +1279,7 @@ class Win11MessageBox(QDialog):
 
 
 class ImageTableModel(QAbstractTableModel):
-    headers = [" ", "Thumbnail", "Filename", "Date", "Time", "F-Stop", "EV", "ISO", "FL", "Lens"]
+    headers = [" ", "Thumbnail", "Filename", "Date", "Time", "F-Stop", "Shutter", "ISO", "FL", "Lens"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1153,6 +1287,15 @@ class ImageTableModel(QAbstractTableModel):
         self.checked_entry_ids = set()
         self.sort_column = 2
         self.sort_order = Qt.AscendingOrder
+        self.defer_sort = False
+        self._row_index = {}
+
+    def _rebuild_row_index(self):
+        self._row_index = {
+            entry.get("entry_id"): row
+            for row, entry in enumerate(self.entries)
+            if entry.get("entry_id")
+        }
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.entries)
@@ -1183,30 +1326,40 @@ class ImageTableModel(QAbstractTableModel):
         entry = self.entries[index.row()]
         column = index.column()
         if column == 0 and role == Qt.CheckStateRole:
-            return Qt.Checked if entry["entry_id"] in self.checked_entry_ids else Qt.Unchecked
-        if column == 1 and role == Qt.DecorationRole:
-            return entry.get("thumbnail") or QPixmap()
-        if role in (Qt.DisplayRole, Qt.EditRole):
-            exif_data = entry.get("exif") or {}
-            values = {
-                2: entry.get("display_name", ""),
-                3: exif_data.get("date", ""),
-                4: exif_data.get("time", ""),
-                5: exif_data.get("f_stop", ""),
-                6: exif_data.get("exposure", ""),
-                7: exif_data.get("iso", ""),
-                8: exif_data.get("focal_length", ""),
-                9: exif_data.get("lens_model", ""),
-            }
-            return values.get(column, "")
-        if role == Qt.UserRole + 1:
-            return entry
-        return None
+            return Qt.Checked if entry.get("entry_id") in self.checked_entry_ids else Qt.Unchecked
+        if column == 1:
+            if role == Qt.DecorationRole:
+                return entry.get("thumbnail")
+            return None
+        if role not in (Qt.DisplayRole, Qt.EditRole):
+            if role == Qt.UserRole + 1:
+                return entry
+            return None
+        if column == 2:
+            return entry.get("display_name", "")
+        exif_data = entry.get("exif") or {}
+        if column == 3:
+            return exif_data.get("date", "")
+        if column == 4:
+            return exif_data.get("time", "")
+        if column == 5:
+            return exif_data.get("f_stop", "")
+        if column == 6:
+            return exif_data.get("exposure", "")
+        if column == 7:
+            return exif_data.get("iso", "")
+        if column == 8:
+            return exif_data.get("focal_length", "")
+        if column == 9:
+            return exif_data.get("lens_model", "")
+        return ""
 
     def setData(self, index, value, role=Qt.EditRole):
         if not index.isValid() or index.column() != 0 or role != Qt.CheckStateRole:
             return False
-        entry_id = self.entries[index.row()]["entry_id"]
+        entry_id = self.entries[index.row()].get("entry_id")
+        if not entry_id:
+            return False
         if value == Qt.Checked:
             self.checked_entry_ids.add(entry_id)
         else:
@@ -1218,18 +1371,20 @@ class ImageTableModel(QAbstractTableModel):
         self.beginResetModel()
         self.entries.clear()
         self.checked_entry_ids.clear()
+        self._row_index.clear()
         self.endResetModel()
 
-    def add_entries(self, entries):
+    def add_entries(self, entries, apply_sort=True):
         if not entries:
             return
-        entries = sorted(entries, key=self.sort_key, reverse=self.sort_order == Qt.DescendingOrder)
         start_row = len(self.entries)
         end_row = start_row + len(entries) - 1
         self.beginInsertRows(QModelIndex(), start_row, end_row)
         self.entries.extend(entries)
+        self._rebuild_row_index()
         self.endInsertRows()
-        self.apply_current_sort()
+        if apply_sort and not self.defer_sort:
+            self.apply_current_sort()
 
     def entry_at(self, row):
         if 0 <= row < len(self.entries):
@@ -1237,10 +1392,9 @@ class ImageTableModel(QAbstractTableModel):
         return None
 
     def row_for_entry_id(self, entry_id):
-        for row, entry in enumerate(self.entries):
-            if entry.get("entry_id") == entry_id:
-                return row
-        return -1
+        if not entry_id:
+            return -1
+        return self._row_index.get(entry_id, -1)
 
     def update_entry_metadata(self, entry_id, exif_data, thumbnail_image):
         row = self.row_for_entry_id(entry_id)
@@ -1250,7 +1404,7 @@ class ImageTableModel(QAbstractTableModel):
         entry["exif"] = exif_data or {}
         if thumbnail_image and not thumbnail_image.isNull():
             entry["thumbnail"] = QPixmap.fromImage(thumbnail_image)
-        if self.sort_column in (3, 4, 5, 6, 7, 8, 9):
+        if not self.defer_sort and self.sort_column in (3, 4, 5, 6, 7, 8, 9):
             if self.apply_current_sort():
                 return
         top_left = self.index(row, 1)
@@ -1259,14 +1413,14 @@ class ImageTableModel(QAbstractTableModel):
 
     def set_all_checked(self, checked):
         if checked:
-            self.checked_entry_ids = {entry["entry_id"] for entry in self.entries}
+            self.checked_entry_ids = {entry.get("entry_id") for entry in self.entries if entry.get("entry_id")}
         else:
             self.checked_entry_ids.clear()
         if self.entries:
             self.dataChanged.emit(self.index(0, 0), self.index(len(self.entries) - 1, 0), [Qt.CheckStateRole])
 
     def selected_entries(self):
-        return [(row, entry) for row, entry in enumerate(self.entries) if entry["entry_id"] in self.checked_entry_ids]
+        return [(row, entry) for row, entry in enumerate(self.entries) if entry.get("entry_id") in self.checked_entry_ids]
 
     def sort(self, column, order=Qt.AscendingOrder):
         if not 0 <= column < len(self.headers):
@@ -1284,6 +1438,7 @@ class ImageTableModel(QAbstractTableModel):
             return False
         self.layoutAboutToBeChanged.emit()
         self.entries = sorted_entries
+        self._rebuild_row_index()
         self.layoutChanged.emit()
         return True
 
@@ -1291,7 +1446,7 @@ class ImageTableModel(QAbstractTableModel):
         exif_data = entry.get("exif") or {}
         column = self.sort_column
         if column == 0:
-            return (entry["entry_id"] not in self.checked_entry_ids, self.filename_key(entry))
+            return (entry.get("entry_id") not in self.checked_entry_ids, self.filename_key(entry))
         if column == 1:
             thumbnail = entry.get("thumbnail")
             has_thumbnail = bool(thumbnail is not None and not thumbnail.isNull())
@@ -1300,18 +1455,24 @@ class ImageTableModel(QAbstractTableModel):
             return self.filename_key(entry)
         if column in (3, 4):
             return self.datetime_key(entry, exif_data)
-        if column in (5, 6, 7, 8):
-            value_map = {
-                5: exif_data.get("f_stop", ""),
-                6: exif_data.get("exposure", ""),
-                7: exif_data.get("iso", ""),
-                8: exif_data.get("focal_length", ""),
-            }
-            number = parse_leading_number(value_map[column])
-            return (number is None, number if number is not None else 0, self.filename_key(entry))
+        if column == 5:
+            return self.number_key(exif_data.get("f_stop"), entry)
+        if column == 6:
+            exposure = exif_data.get("exposure_seconds")
+            if exposure is None:
+                exposure = parse_exposure_seconds(exif_data.get("exposure"))
+            return self.number_key(exposure, entry)
+        if column == 7:
+            return self.number_key(exif_data.get("iso"), entry)
+        if column == 8:
+            return self.number_key(exif_data.get("focal_length"), entry)
         if column == 9:
             return (str(exif_data.get("lens_model", "")).casefold(), self.filename_key(entry))
         return self.filename_key(entry)
+
+    def number_key(self, value, entry):
+        number = value if isinstance(value, (int, float)) else parse_leading_number(value)
+        return (number is None, number if number is not None else 0, self.filename_key(entry))
 
     def filename_key(self, entry):
         return natural_sort_key(entry.get("display_name", ""))
@@ -1338,13 +1499,26 @@ class ThumbnailDelegate(QStyledItemDelegate):
             return
 
         pixmap = index.data(Qt.DecorationRole)
-        if not pixmap or pixmap.isNull():
+        if pixmap is None or pixmap.isNull():
             super().paint(painter, option, index)
             return
 
-        x_pos = option.rect.x() + (option.rect.width() - self.thumbnail_size.width()) // 2
-        y_pos = option.rect.y() + (option.rect.height() - self.thumbnail_size.height()) // 2
-        painter.drawPixmap(x_pos, y_pos, self.thumbnail_size.width(), self.thumbnail_size.height(), pixmap)
+        # Let the style draw the row background/selection, then paint the
+        # thumbnail centered at its own aspect ratio (never stretched).
+        style_option = QStyleOptionViewItem(option)
+        self.initStyleOption(style_option, index)
+        style_option.text = ""
+        style_option.icon = QIcon()
+        widget = style_option.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, style_option, painter, widget)
+
+        scaled = pixmap
+        if pixmap.width() > self.thumbnail_size.width() or pixmap.height() > self.thumbnail_size.height():
+            scaled = pixmap.scaled(self.thumbnail_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        x_pos = option.rect.x() + (option.rect.width() - scaled.width()) // 2
+        y_pos = option.rect.y() + (option.rect.height() - scaled.height()) // 2
+        painter.drawPixmap(x_pos, y_pos, scaled)
 
     def sizeHint(self, option, index):
         base_size = super().sizeHint(option, index)
@@ -1425,31 +1599,67 @@ class ImageLoaderThread(QThread):
         self.cancelled = True
         self.running = False
 
+    def _should_continue(self):
+        return self.running
+
+    def _scan_progress(self, scanned_count):
+        if self.running:
+            self.status_signal.emit(f"Scanning... {scanned_count} files found")
+
     def build_entries(self):
-        file_records = scan_image_files(self.directory, self.include_subfolders, lambda: self.running)
+        file_records = scan_image_files(self.directory, self.include_subfolders, self._should_continue)
         if self.combine_pairs:
             return build_grouped_entries(file_records)
         return [build_single_entry(record) for record in file_records]
 
-    def run(self):
-        try:
-            entries = self.build_entries()
+    def _emit_entries(self, entries):
+        batch = []
+        for index, entry in enumerate(entries, start=1):
             if not self.running:
                 return
-            total_entries = len(entries)
-            batch = []
-            for index, entry in enumerate(entries, start=1):
-                if not self.running:
-                    break
-                batch.append(entry)
-                if len(batch) >= 64:
-                    self.entries_loaded_signal.emit(batch)
-                    batch = []
-                self.progress_signal.emit(index, total_entries)
-                if index == 1 or index % 100 == 0:
-                    self.status_signal.emit(f"Found {index} of {total_entries} entries")
-            if batch and self.running:
+            batch.append(entry)
+            if len(batch) >= 64:
                 self.entries_loaded_signal.emit(batch)
+                batch = []
+            self.progress_signal.emit(index, len(entries))
+            if index == 1 or index % 100 == 0:
+                self.status_signal.emit(f"Found {index} of {len(entries)} entries")
+        if batch and self.running:
+            self.entries_loaded_signal.emit(batch)
+
+    def _stream_single_entries(self):
+        batch = []
+        count = 0
+        for record in iter_image_files(
+            self.directory,
+            self.include_subfolders,
+            self._should_continue,
+            self._scan_progress,
+        ):
+            if not self.running:
+                return
+            batch.append(build_single_entry(record))
+            count += 1
+            if len(batch) >= 64:
+                self.status_signal.emit(f"Scanning... {count} files found")
+                self.entries_loaded_signal.emit(batch)
+                batch = []
+        if batch and self.running:
+            self.entries_loaded_signal.emit(batch)
+        if self.running:
+            self.status_signal.emit(f"Found {count} entries")
+
+    def run(self):
+        try:
+            if self.combine_pairs:
+                # Pairing needs the complete file list before rows can be
+                # grouped, so scan first and then publish in batches.
+                file_records = scan_image_files(self.directory, self.include_subfolders, self._should_continue)
+                if not self.running:
+                    return
+                self._emit_entries(build_grouped_entries(file_records))
+            else:
+                self._stream_single_entries()
         except Exception:
             LOGGER.exception("Image loader thread failed")
         finally:
@@ -1458,46 +1668,73 @@ class ImageLoaderThread(QThread):
 
 class MetadataLoaderThread(QThread):
     metadata_ready_signal = pyqtSignal(str, dict, QImage)
-    status_signal = pyqtSignal(str)
 
     def __init__(self, thumbnail_size):
         super().__init__()
         self.thumbnail_size = thumbnail_size
         self.running = True
-        self.pending = deque()
-        self.pending_ids = set()
-        self.completed_ids = set()
+        self._condition = threading.Condition()
+        self._pending = deque()
+        self._pending_ids = set()
+        self._inflight_ids = set()
+        self._completed_ids = set()
 
     def cancel(self):
-        self.running = False
+        with self._condition:
+            self.running = False
+            self._pending.clear()
+            self._pending_ids.clear()
+            self._condition.notify_all()
 
     def add_entries(self, entries, priority=False):
         new_entries = []
-        for entry in entries:
+        with self._condition:
+            if not self.running:
+                return
+            for entry in entries:
+                entry_id = entry.get("entry_id")
+                if not entry_id:
+                    continue
+                if entry_id in self._pending_ids or entry_id in self._inflight_ids or entry_id in self._completed_ids:
+                    continue
+                self._pending_ids.add(entry_id)
+                new_entries.append(entry)
+            if not new_entries:
+                return
+            if priority:
+                for entry in reversed(new_entries):
+                    self._pending.appendleft(entry)
+            else:
+                self._pending.extend(new_entries)
+            self._condition.notify()
+
+    def _next_entry(self):
+        with self._condition:
+            while self.running and not self._pending:
+                self._condition.wait(0.5)
+            if not self.running:
+                return None
+            entry = self._pending.popleft()
             entry_id = entry.get("entry_id")
-            if not entry_id or entry_id in self.pending_ids or entry_id in self.completed_ids:
-                continue
-            self.pending_ids.add(entry_id)
-            new_entries.append(entry)
-        if priority:
-            for entry in reversed(new_entries):
-                self.pending.appendleft(entry)
-        else:
-            self.pending.extend(new_entries)
+            self._pending_ids.discard(entry_id)
+            self._inflight_ids.add(entry_id)
+            return entry
+
+    def _finish_entry(self, entry_id):
+        with self._condition:
+            self._inflight_ids.discard(entry_id)
+            if entry_id:
+                self._completed_ids.add(entry_id)
 
     def run(self):
         while self.running:
-            if not self.pending:
-                self.msleep(10)
-                continue
-            entry = self.pending.popleft()
-            entry_id = entry.get("entry_id")
-            self.pending_ids.discard(entry_id)
-            if not self.running:
+            entry = self._next_entry()
+            if entry is None:
                 break
+            entry_id = entry.get("entry_id")
             preview_path = choose_preview_path(entry, show_raw=False)
             if not preview_path:
-                self.completed_ids.add(entry_id)
+                self._finish_entry(entry_id)
                 self.metadata_ready_signal.emit(entry_id, {}, QImage())
                 continue
             exif_data = extract_exif(preview_path)
@@ -1506,8 +1743,48 @@ class MetadataLoaderThread(QThread):
             thumbnail = create_thumbnail_image(preview_path, self.thumbnail_size)
             if not self.running:
                 break
-            self.completed_ids.add(entry_id)
+            self._finish_entry(entry_id)
             self.metadata_ready_signal.emit(entry_id, exif_data, thumbnail)
+
+
+class ImagePreviewThread(QThread):
+    finished_signal = pyqtSignal(int, str, QImage)
+    error_signal = pyqtSignal(int, str, str)
+
+    def __init__(self, request_id, file_path, target_size, high_quality=True):
+        super().__init__()
+        self.request_id = request_id
+        self.file_path = file_path
+        self.target_size = target_size
+        self.high_quality = high_quality
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            if self._cancelled:
+                return
+            reader = QImageReader(self.file_path)
+            reader.setAutoTransform(True)
+            source_size = reader.size()
+            if source_size.isValid():
+                source_size.scale(self.target_size, Qt.KeepAspectRatio)
+                reader.setScaledSize(source_size)
+            image = reader.read()
+            if self._cancelled:
+                return
+            if image.isNull():
+                self.error_signal.emit(self.request_id, self.file_path, reader.errorString() or "Unsupported image")
+                return
+            scaled = scaled_image_for_size(image, self.target_size, smooth=self.high_quality)
+            if self._cancelled:
+                return
+            self.finished_signal.emit(self.request_id, self.file_path, scaled)
+        except Exception as exc:
+            LOGGER.exception("Preview failed for %s", self.file_path)
+            self.error_signal.emit(self.request_id, self.file_path, str(exc))
 
 
 class RawPreviewThread(QThread):
@@ -1562,14 +1839,16 @@ class MainWindow(QMainWindow):
         self.current_image_path = None
         self.show_raw = False
         self.loading_in_progress = False
+        self.file_operation_active = False
         self.preview_request_id = 0
         self.preview_thread = None
+        self.preview_threads = set()
         self.loader_thread = None
         self.metadata_thread = None
         self.exif_cache = OrderedDict()
-        self.thumbnail_cache = OrderedDict()
         self.raw_cache = OrderedDict()
         self._initial_load_started = False
+        self._closing = False
 
         self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1440, 860)
@@ -1971,8 +2250,6 @@ class MainWindow(QMainWindow):
         subfolders_changed = settings["include_subfolders"] != previous_settings["include_subfolders"]
         theme_changed = settings["dark_mode"] != previous_settings["dark_mode"]
 
-        if thumb_changed:
-            self.thumbnail_cache.clear()
         if raw_preview_changed:
             self.raw_cache.clear()
 
@@ -1984,15 +2261,27 @@ class MainWindow(QMainWindow):
                 self.load_preview_image(choose_preview_path(self.current_entry(), self.show_raw))
 
     def select_folder(self):
+        if self.file_operation_active:
+            return
         folder_path = QFileDialog.getExistingDirectory(self, "Select Image Folder", self.current_folder or "")
         if not folder_path:
             return
         self.current_folder = folder_path
+        self.remember_source_folder(folder_path)
         self.current_image_path = None
         self.current_entry_id = None
         self.preview_label.setText("No image selected")
         self.preview_label.setPixmap(QPixmap())
         self.load_image_files(folder_path)
+
+    def remember_source_folder(self, folder_path):
+        if not folder_path:
+            return
+        settings = self.settings_manager.current_settings.copy()
+        if settings.get("default_source_folder") == folder_path:
+            return
+        settings["default_source_folder"] = folder_path
+        self.settings_manager.save_settings(settings)
 
     def set_loading_state(self, active):
         self.loading_in_progress = active
@@ -2017,6 +2306,16 @@ class MainWindow(QMainWindow):
             self.loader_thread.cancel()
             self.statusBar().showMessage("Cancelling image load...", 3000)
 
+    def _is_current_loader(self):
+        """Return True when the emitting loader thread is still the active one.
+
+        Signals from a cancelled loader stay queued in the GUI event loop, so
+        without this check entries from the previous folder could be inserted
+        into the newly loaded model.
+        """
+        sender = self.sender()
+        return sender is None or sender is self.loader_thread
+
     def load_image_files(self, directory):
         if not directory or not os.path.isdir(directory):
             return
@@ -2024,21 +2323,22 @@ class MainWindow(QMainWindow):
 
         if self.loader_thread and self.loader_thread.isRunning():
             self.loader_thread.cancel()
-            self.loader_thread.wait(3000)
+            if not self.loader_thread.wait(5000):
+                LOGGER.warning("Previous image loader did not stop in time")
         if self.metadata_thread and self.metadata_thread.isRunning():
             self.metadata_thread.cancel()
-            if not self.metadata_thread.wait(3000):
-                self.metadata_thread.terminate()
-                self.metadata_thread.wait(1000)
+            if not self.metadata_thread.wait(5000):
+                LOGGER.warning("Previous metadata loader did not stop in time")
 
+        self.preview_request_id += 1
         self.current_entry_id = None
         self.current_image_path = None
         self.preview_label.setText("Loading...")
         self.preview_label.setPixmap(QPixmap())
+        self.list_model.defer_sort = True
         self.list_model.clear()
         self.setup_table_headers()
-        self.status_progress.setValue(0)
-        self.status_progress.setMaximum(1)
+        self.status_progress.setRange(0, 0)
         self.set_loading_state(True)
 
         self.metadata_thread = MetadataLoaderThread(self.settings_manager.get_setting("thumbnail_size"))
@@ -2066,40 +2366,25 @@ class MainWindow(QMainWindow):
         trim_cache(self.exif_cache, MAX_EXIF_CACHE)
         return exif_data
 
-    def get_cached_thumbnail(self, file_path, thumbnail_size, exif_data):
-        cache_key = (normalize_path(file_path), int(thumbnail_size))
-        if cache_key in self.thumbnail_cache:
-            self.thumbnail_cache.move_to_end(cache_key)
-            return self.thumbnail_cache[cache_key]
-        thumbnail = create_thumbnail(file_path, thumbnail_size, exif_data)
-        self.thumbnail_cache[cache_key] = thumbnail
-        trim_cache(self.thumbnail_cache, MAX_THUMB_CACHE)
-        return thumbnail
-
     def add_entries_to_model(self, entries):
+        if not self._is_current_loader():
+            return
         if self.loader_thread and self.loader_thread.cancelled:
             return
-        self.list_model.add_entries(entries)
+        self.list_model.add_entries(entries, apply_sort=False)
         if self.metadata_thread and self.metadata_thread.isRunning():
             self.metadata_thread.add_entries(self.visible_entries(), priority=True)
         if self.list_model.rowCount() and not self.list_view.selectionModel().selectedRows():
             self.list_view.selectRow(0)
 
     def update_entry_metadata(self, entry_id, exif_data, thumbnail_image):
-        entry = None
         row = self.list_model.row_for_entry_id(entry_id)
-        if row >= 0:
-            entry = self.list_model.entry_at(row)
+        entry = self.list_model.entry_at(row) if row >= 0 else None
         if entry:
             preview_path = choose_preview_path(entry, show_raw=False)
             if preview_path:
-                exif_key = normalize_path(preview_path)
-                self.exif_cache[exif_key] = exif_data or {}
-                if thumbnail_image and not thumbnail_image.isNull():
-                    thumb_key = (exif_key, int(self.settings_manager.get_setting("thumbnail_size")))
-                    self.thumbnail_cache[thumb_key] = QPixmap.fromImage(thumbnail_image)
+                self.exif_cache[normalize_path(preview_path)] = exif_data or {}
                 trim_cache(self.exif_cache, MAX_EXIF_CACHE)
-                trim_cache(self.thumbnail_cache, MAX_THUMB_CACHE)
         self.list_model.update_entry_metadata(entry_id, exif_data, thumbnail_image)
 
     def visible_entries(self, extra_rows=20):
@@ -2118,11 +2403,18 @@ class MainWindow(QMainWindow):
             self.metadata_thread.add_entries(self.visible_entries(), priority=True)
 
     def loading_finished(self):
+        if not self._is_current_loader():
+            return
         cancelled = bool(self.loader_thread and self.loader_thread.cancelled)
+        self.list_model.defer_sort = False
         self.set_loading_state(False)
         self.status_progress.setVisible(False)
+        self.status_progress.setRange(0, 1)
+        self.status_progress.setValue(0)
         if cancelled and self.metadata_thread and self.metadata_thread.isRunning():
             self.metadata_thread.cancel()
+        if self.list_model.rowCount():
+            self.list_model.apply_current_sort()
         if cancelled:
             self.statusBar().showMessage(f"Cancelled after loading {self.list_model.rowCount()} entries", 3000)
         else:
@@ -2137,7 +2429,12 @@ class MainWindow(QMainWindow):
             self.queue_visible_metadata()
 
     def update_load_progress(self, current, total):
-        self.status_progress.setMaximum(max(total, 1))
+        if not self._is_current_loader():
+            return
+        if total <= 0:
+            self.status_progress.setRange(0, 0)
+            return
+        self.status_progress.setRange(0, max(total, 1))
         self.status_progress.setValue(current)
 
     def current_entry(self):
@@ -2190,13 +2487,36 @@ class MainWindow(QMainWindow):
         request_id = self.preview_request_id
         gamma_value = self.settings_manager.get_setting("raw_gamma")
         thread = RawPreviewThread(request_id, file_path, self.preview_target_size(), quality, gamma_value)
-        if self.preview_thread and self.preview_thread.isRunning():
-            self.preview_thread.cancel()
-        self.preview_thread = thread
+        self._register_preview_thread(thread)
         thread.finished_signal.connect(self.handle_raw_preview_ready)
         thread.error_signal.connect(self.handle_raw_preview_error)
         thread.finished.connect(self.cleanup_preview_thread)
         thread.start()
+
+    def start_image_preview_thread(self, file_path, high_quality=True):
+        self.preview_request_id += 1
+        request_id = self.preview_request_id
+        thread = ImagePreviewThread(request_id, file_path, self.preview_target_size(), high_quality)
+        self._register_preview_thread(thread)
+        thread.finished_signal.connect(self.handle_image_preview_ready)
+        thread.error_signal.connect(self.handle_image_preview_error)
+        thread.finished.connect(self.cleanup_preview_thread)
+        thread.start()
+
+    def _register_preview_thread(self, thread):
+        # Keep a Python reference until the thread has actually finished;
+        # otherwise a cancelled-but-running QThread can be garbage collected
+        # and crash the process.
+        for old_thread in list(self.preview_threads):
+            if old_thread.isRunning():
+                old_thread.cancel()
+        self.preview_threads.add(thread)
+        self.preview_thread = thread
+
+    def show_preview_loading(self, text):
+        pixmap = self.preview_label.pixmap()
+        if pixmap is None or pixmap.isNull():
+            self.preview_label.setText(text)
 
     def load_preview_image(self, file_path, low_quality=False):
         if not file_path or not os.path.exists(file_path):
@@ -2207,10 +2527,11 @@ class MainWindow(QMainWindow):
         self.current_image_path = file_path
         if is_raw_file(file_path):
             quality = "low" if low_quality else self.settings_manager.get_setting("raw_preview_quality")
+            target_size = self.preview_target_size()
             cache_key = (
                 normalize_path(file_path),
-                self.preview_target_size().width(),
-                self.preview_target_size().height(),
+                target_size.width(),
+                target_size.height(),
                 quality,
                 float(self.settings_manager.get_setting("raw_gamma")),
             )
@@ -2218,30 +2539,12 @@ class MainWindow(QMainWindow):
                 self.raw_cache.move_to_end(cache_key)
                 self.set_preview_pixmap(self.raw_cache[cache_key])
                 return
-            self.preview_label.setText("Loading RAW image...")
-            self.preview_label.setPixmap(QPixmap())
+            self.show_preview_loading("Loading RAW image...")
             self.start_raw_preview_thread(file_path, quality)
             return
 
-        try:
-            target_size = self.preview_target_size()
-            reader = QImageReader(file_path)
-            reader.setAutoTransform(True)
-            source_size = reader.size()
-            if source_size.isValid():
-                source_size.scale(target_size, Qt.KeepAspectRatio)
-                reader.setScaledSize(source_size)
-            image = reader.read()
-            if image.isNull():
-                self.preview_label.setText("Could not load image")
-                self.preview_label.setPixmap(QPixmap())
-                return
-            scaled = scaled_image_for_size(image, target_size, smooth=not low_quality)
-            self.set_preview_pixmap(QPixmap.fromImage(scaled))
-        except Exception:
-            LOGGER.exception("Error loading preview for %s", file_path)
-            self.preview_label.setText("Error loading preview")
-            self.preview_label.setPixmap(QPixmap())
+        self.show_preview_loading("Loading image...")
+        self.start_image_preview_thread(file_path, high_quality=not low_quality)
 
     def set_preview_pixmap(self, scaled_pixmap):
         self.preview_label.setText("")
@@ -2251,12 +2554,16 @@ class MainWindow(QMainWindow):
         if request_id != self.preview_request_id or file_path != self.current_image_path:
             return
         scaled_pixmap = QPixmap.fromImage(scaled_image)
+        thread = self.sender()
+        target_size = thread.target_size if thread is not None else self.preview_target_size()
+        quality = thread.quality if thread is not None else self.settings_manager.get_setting("raw_preview_quality")
+        gamma = float(thread.gamma if thread is not None else self.settings_manager.get_setting("raw_gamma"))
         cache_key = (
             normalize_path(file_path),
-            self.preview_target_size().width(),
-            self.preview_target_size().height(),
-            self.settings_manager.get_setting("raw_preview_quality"),
-            float(self.settings_manager.get_setting("raw_gamma")),
+            target_size.width(),
+            target_size.height(),
+            quality,
+            gamma,
         )
         self.raw_cache[cache_key] = scaled_pixmap
         trim_cache(self.raw_cache, MAX_RAW_CACHE)
@@ -2268,9 +2575,24 @@ class MainWindow(QMainWindow):
         self.preview_label.setText(f"Error loading RAW image:\n{error_text}")
         self.preview_label.setPixmap(QPixmap())
 
+    def handle_image_preview_ready(self, request_id, file_path, scaled_image):
+        if request_id != self.preview_request_id or file_path != self.current_image_path:
+            return
+        self.set_preview_pixmap(QPixmap.fromImage(scaled_image))
+
+    def handle_image_preview_error(self, request_id, file_path, error_text):
+        if request_id != self.preview_request_id or file_path != self.current_image_path:
+            return
+        LOGGER.warning("Could not load preview for %s: %s", file_path, error_text)
+        self.preview_label.setText(f"Could not load image\n{Path(file_path).name}")
+        self.preview_label.setPixmap(QPixmap())
+
     def cleanup_preview_thread(self):
-        sender = self.sender()
-        if sender is self.preview_thread:
+        thread = self.sender()
+        if thread is None:
+            return
+        self.preview_threads.discard(thread)
+        if thread is self.preview_thread:
             self.preview_thread = None
 
     def resizeEvent(self, event):
@@ -2279,7 +2601,7 @@ class MainWindow(QMainWindow):
 
     def reload_preview_after_resize(self):
         if self.current_image_path:
-            self.load_preview_image(self.current_image_path, low_quality=is_raw_file(self.current_image_path))
+            self.load_preview_image(self.current_image_path, low_quality=True)
 
     def toggle_preview_mode(self):
         self.show_raw = self.toggle_button.isChecked()
@@ -2324,11 +2646,15 @@ class MainWindow(QMainWindow):
         if rename_files:
             base_name = self.get_exif_datetime_filename(str(source), exif_data)
             target_path = Path(destination_folder) / f"{base_name}{source.suffix}"
-            if target_path.exists():
+            if paths_are_same(source, target_path) or target_path.exists():
                 target_path = self.next_available_path(target_path)
             return str(target_path), replace_all, skip_all, False
 
         target_path = Path(destination_folder) / source.name
+        if paths_are_same(source, target_path):
+            # Copying into the source folder itself must never offer to
+            # replace (and delete) the original file.
+            return str(self.next_available_path(target_path)), replace_all, skip_all, False
         if not target_path.exists():
             return str(target_path), replace_all, skip_all, False
         if replace_all:
@@ -2350,10 +2676,63 @@ class MainWindow(QMainWindow):
             return str(target_path), replace_all, skip_all, True
         if response == QMessageBox.NoToAll:
             return None, replace_all, True, False
+        if response == QMessageBox.Rejected:
+            return None, replace_all, skip_all, False
         unique_path = self.next_available_path(target_path)
         return str(unique_path), replace_all, skip_all, False
 
+    def copy_file_safely(self, source_path, target_path, replace):
+        source = Path(source_path)
+        target = Path(target_path)
+        if paths_are_same(source, target):
+            raise ValueError("Source and destination are the same file")
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        if not replace and not target.exists():
+            shutil.copy2(source, target)
+            return
+
+        # Copy next to the target first and swap atomically, so a failed or
+        # interrupted copy never destroys the file that is being replaced.
+        temp_path = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        try:
+            shutil.copy2(source, temp_path)
+            os.replace(temp_path, target)
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    LOGGER.warning("Could not remove temporary file %s", temp_path)
+
+    def move_file_safely(self, source_path, target_path, replace):
+        source = Path(source_path)
+        target = Path(target_path)
+        if paths_are_same(source, target):
+            raise ValueError("Source and destination are the same file")
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        if replace or not target.exists():
+            try:
+                os.replace(source, target)
+                return
+            except OSError:
+                # Different volume or a locked target: fall back to copy+delete.
+                pass
+
+        self.copy_file_safely(source, target, True)
+        try:
+            source.unlink()
+        except OSError:
+            LOGGER.warning("Copied %s but could not remove the source file", source)
+
+    def set_operation_state(self, enabled):
+        for button in self.buttons:
+            button.setEnabled(enabled)
+
     def process_selected_files(self):
+        if self.file_operation_active:
+            return
         selected_rows = self.get_selected_rows()
         if not selected_rows:
             QMessageBox.warning(self, "No Selection", "Please select files to process.")
@@ -2369,8 +2748,24 @@ class MainWindow(QMainWindow):
         if not os.path.isdir(destination):
             QMessageBox.warning(self, "Invalid Destination", "The destination folder does not exist.")
             return
+        if operation_mode == "move" and paths_are_same(destination, self.current_folder):
+            Win11MessageBox(
+                self,
+                "Same Folder",
+                "The destination folder is the same as the source folder.\n"
+                "Choose a different destination before moving files.",
+                QMessageBox.Ok,
+                QMessageBox.Warning,
+            ).exec_()
+            return
 
-        total_files = sum(len(entry["all_paths"]) for _, entry in selected_rows)
+        total_files = sum(len(entry.get("all_paths", [])) for _, entry in selected_rows)
+        if not total_files:
+            QMessageBox.warning(self, "No Files", "The selected entries do not contain any files.")
+            return
+
+        self.file_operation_active = True
+        self.set_operation_state(False)
         progress = FileOperationDialog(self, operation_mode, total_files)
         progress.show()
         QApplication.processEvents()
@@ -2378,19 +2773,24 @@ class MainWindow(QMainWindow):
         replace_all = False
         skip_all = False
         processed_count = 0
+        success_count = 0
+        failed_count = 0
+        skipped_count = 0
         moved_anything = False
+        cancelled = False
 
         try:
             for _, entry in selected_rows:
+                if cancelled:
+                    break
                 entry_exif = entry.get("exif") or {}
                 if rename_files and not entry_exif.get("datetime_original"):
                     metadata_path = choose_preview_path(entry, show_raw=False)
                     if metadata_path:
                         entry_exif = self.get_cached_exif(metadata_path)
-                entry_success = True
-                for file_path in entry["all_paths"]:
+                for file_path in entry.get("all_paths", []):
                     if progress.is_cancelled():
-                        self.statusBar().showMessage("File operation cancelled", 3000)
+                        cancelled = True
                         break
 
                     processed_count += 1
@@ -2406,48 +2806,50 @@ class MainWindow(QMainWindow):
                         skip_all,
                     )
                     if not target_path:
-                        entry_success = False
+                        skipped_count += 1
                         continue
 
                     try:
-                        if should_replace and os.path.exists(target_path):
-                            os.remove(target_path)
                         if operation_mode == "copy":
-                            shutil.copy2(file_path, target_path)
+                            self.copy_file_safely(file_path, target_path, should_replace)
                         else:
-                            shutil.move(file_path, target_path)
+                            self.move_file_safely(file_path, target_path, should_replace)
                             moved_anything = True
+                        success_count += 1
                     except Exception:
-                        entry_success = False
-                        LOGGER.exception("Failed while %sing %s", operation_mode, file_path)
-                        dialog = Win11MessageBox(
+                        failed_count += 1
+                        LOGGER.warning("Failed while %sing %s", operation_mode, file_path, exc_info=True)
+                        Win11MessageBox(
                             self,
                             "Error",
                             f"Error while {operation_mode}ing {Path(file_path).name}. See log for details.",
                             QMessageBox.Ok,
                             QMessageBox.Critical,
-                        )
-                        dialog.exec_()
-
-                if progress.is_cancelled():
-                    break
-                if not entry_success:
-                    LOGGER.warning("Entry processed with issues: %s", entry["display_name"])
-
-            if moved_anything:
-                self.load_image_files(self.current_folder)
-
-            operation_past = "copied" if operation_mode == "copy" else "moved"
-            dialog = Win11MessageBox(
-                self,
-                "Complete",
-                f"Successfully {operation_past} up to {processed_count} file(s) to {destination}.",
-                QMessageBox.Ok,
-                QMessageBox.Information,
-            )
-            dialog.exec_()
+                        ).exec_()
         finally:
             progress.close()
+            self.file_operation_active = False
+            self.set_operation_state(True)
+
+        if moved_anything:
+            self.load_image_files(self.current_folder)
+
+        operation_past = "copied" if operation_mode == "copy" else "moved"
+        if cancelled:
+            summary = f"Cancelled after {success_count} of {total_files} file(s)."
+        else:
+            summary = f"{success_count} file(s) {operation_past} to {destination}."
+        if skipped_count:
+            summary += f"\n{skipped_count} file(s) skipped."
+        if failed_count:
+            summary += f"\n{failed_count} file(s) failed. See log for details."
+        Win11MessageBox(
+            self,
+            "Complete" if not cancelled else "Cancelled",
+            summary,
+            QMessageBox.Ok,
+            QMessageBox.Information if not failed_count else QMessageBox.Warning,
+        ).exec_()
 
     def edit_current_image(self):
         if not self.current_image_path:
@@ -2504,25 +2906,50 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", "Failed to prepare the file for editing.")
 
     def closeEvent(self, event):
-        if self.loader_thread and self.loader_thread.isRunning():
+        if self.file_operation_active:
+            event.ignore()
+            self.statusBar().showMessage("A file operation is still running. Please wait.", 3000)
+            return
+
+        self._closing = True
+        threads = []
+        if self.loader_thread:
             self.loader_thread.cancel()
-            self.loader_thread.wait(5000)
-        if self.metadata_thread and self.metadata_thread.isRunning():
+            threads.append(("image loader", self.loader_thread))
+        if self.metadata_thread:
             self.metadata_thread.cancel()
-            if not self.metadata_thread.wait(5000):
-                self.metadata_thread.terminate()
-                self.metadata_thread.wait(1000)
-        if self.preview_thread and self.preview_thread.isRunning():
-            self.preview_thread.cancel()
-            self.preview_thread.wait(5000)
+            threads.append(("metadata loader", self.metadata_thread))
+        for thread in list(self.preview_threads):
+            thread.cancel()
+            threads.append(("preview", thread))
+
+        for name, thread in threads:
+            if thread.isRunning() and not thread.wait(8000):
+                LOGGER.warning("The %s thread did not stop before shutdown", name)
+
         super().closeEvent(event)
+
+
+def install_exception_hook():
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        LOGGER.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+    sys.excepthook = handle_exception
 
 
 def main():
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
-    QApplication.setApplicationName(APP_NAME)
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    ensure_application_identity()
+    install_exception_hook()
     app = QApplication(sys.argv)
+    app.setApplicationDisplayName(APP_NAME)
     window = MainWindow()
+    window.show()
     sys.exit(app.exec_())
 
 

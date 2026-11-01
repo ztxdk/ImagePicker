@@ -16,8 +16,14 @@ output/
 *.spec
 
 # Local historical Python versions and local tests
+ImagePicker022.py
+ImagePicker028.py
+ImagePicker029.py
+ImagePicker030.py
+ImagePicker031.py
 ImagePicker032.py
 ImagePicker033.py
+ImagePicker034.py
 tests/
 
 # Local app/runtime files
@@ -33,3 +39,10 @@ edits/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local scratch/experiment files
+old/
+Req.txt
+testest*.py
+testtest*.py
+11350308/

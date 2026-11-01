@@ -105,3 +105,18 @@ Denne fil logger alle handlinger udfort i forbindelse med den aktuelle opgave.
 98. `ImagePicker032.py`, `ImagePicker033.py` og alle tracked `tests/test_imagepicker*.py` blev fjernet fra git-indexet med `git rm --cached`, saa de bevares lokalt men fjernes fra GitHub efter push.
 99. `.gitignore` blev udvidet med lokale historiske Python-versioner og `tests/`, saa de ikke bliver re-added ved et uheld.
 100. `README.md` blev opdateret til at pege paa `ImagePicker034.py` som eneste aktive Python-kildefil og fjerne testfil-referencer fra projektfiloversigten.
+101. Bruger bad om et review af `ImagePicker034.py` med forslag til forbedringer; gennemgangen fandt data-tab-fejl ved copy/move til samme mappe, stale load-signaler, `QPixmap` i worker-traade, RAW-traad-livscyklus, død kode, O(n^2)-opslag i tabellen og manglende testdaekning.
+102. `.venv312` viste sig at pege paa en afinstalleret Python 3.12, saa et nyt `.venv313` blev oprettet med Python 3.13 og dependencies fra `requirements.txt`.
+103. `ImagePicker035.py` blev oprettet som kopi af `ImagePicker034.py`, saa version 34 ikke blev overskrevet, og `tests/test_imagepicker035.py` blev oprettet som kopi af version 34-testen.
+104. Filoperationer blev gjort sikre: copy/move til samme sti afvises, kopiering til eksisterende fil sker via temp-fil + `os.replace`, og move bruger `os.replace` med copy+delete som fallback.
+105. Stale signaler fra en tidligere load-traad ignoreres nu via `_is_current_loader()`, og `QThread.terminate()` blev fjernet fra baade mappeskift og nedlukning.
+106. `MetadataLoaderThread` blev omskrevet med `threading.Condition`, eksplicit in-flight-sporing og afbrydelig wait i stedet for busy-polling.
+107. Billedpreview blev flyttet til en `ImagePreviewThread`, RAW-preview-traade holdes i et sæt indtil `finished`, og RAW-cache-noeglen bruger nu den faktisk anvendte kvalitet og stoerrelse.
+108. `QPixmap` blev fjernet fra worker-traadene, dobbelt-thumbnail og den ubrugte `thumbnail_cache` blev fjernet, og tabelmodellen fik et `entry_id -> row`-indeks samt udskudt sortering under load.
+109. Thumbnail-delegaten tegner nu baggrund/selection via style og skalerer billedet aspect-correct; kolonnen `EV` blev omdoebt til `Shutter` og sorteres numerisk via `exposure_seconds`.
+110. Log- og settings-stien blev forenet i `%LOCALAPPDATA%\ImagePicker`, logging fik rotation, gamle settings læses som fallback, og settings-dialogen er nu scrollbar og bevarer skjulte noegler.
+111. Sidst valgte mappe huskes, usynlig `ctypes`/orienteringskode og andre dode hjælpefunktioner blev fjernet, og `main()` fik high-DPI-attributter samt en loggende exception-hook.
+112. `tests/test_imagepicker035.py` blev udvidet til 31 tests med daekning for samme-mappe-sikkerhed, atomisk replace, numerisk shutter-sortering, stale load-signaler, settings-koercion og ende-til-ende copy.
+113. `ImagePicker035.py` og testfilen blev syntaksverificeret med `py_compile` og `pyflakes`, og hele test-suiten bestod med 74 tests.
+114. En offscreen smoke-test af version 035 indlaeste `pics`, viste preview via den nye async-traad, skiftede raekker og lukkede appen uden fejl.
+115. `README.md` blev opdateret til version 035 med nye performance-, sikkerheds- og konfigurationsnoter, `ImagePicker035.spec` blev oprettet, og `.gitignore` blev justeret saa kun version 035 er aktiv i repoet.
